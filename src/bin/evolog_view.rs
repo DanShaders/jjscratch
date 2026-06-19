@@ -31,7 +31,7 @@
 
 use jjscratch::text;
 use jjscratch::theme::font;
-use jjscratch::ui::{baseline_for, border_bottom, fill_rect, fill_round, stroke_round, RenderCtx};
+use jjscratch::ui::{baseline_for, border_bottom, fill_rect, stroke_round, RenderCtx};
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill};
 use vello::Scene;
@@ -98,59 +98,34 @@ pub struct MockEvologEntry {
     pub origin: bool,
 }
 
-/// Stub evolution log: ONE change with three evolutions (newest first), each with
-/// a small inter-diff, plus an origin entry with no predecessor. INTEGRATION:
-/// this is the placeholder for a jjlib evolog query of the selected change.
+/// Stub evolution log mirroring the committed fixture's working-copy (`@`)
+/// evolution (see `tools/bin/jj -R fixture/repo evolog`): two entries, newest
+/// first — a `snapshot working copy` step (current, amber id) with the live
+/// working-copy edit as its inter-diff, then the `commit …` origin entry with no
+/// predecessor. This aligns the preview with `docs/reference/evolog.png` for
+/// eyeball-matching. INTEGRATION: replace with a jjlib evolog query.
 pub fn mock_entries() -> Vec<MockEvologEntry> {
     vec![
         MockEvologEntry {
-            commit_id: "a1b2c3d4e5f6".into(),
-            operation: "describe commit".into(),
-            time: "2026-06-19 14:02:11".into(),
-            file_path: "src/flags.rs".into(),
+            commit_id: "e1d4d4b4cd3a".into(),
+            operation: "snapshot working copy".into(),
+            time: "2026-01-15 10:00:00".into(),
+            file_path: "src/parser.rs".into(),
             current: true,
             origin: false,
             diff: vec![
-                MockDiffLine::ctx(11, 11, "pub struct Flags {"),
-                MockDiffLine::ctx(12, 12, "    pub verbose: bool,"),
-                MockDiffLine::remove(13, "    pub color: bool,"),
-                MockDiffLine::add(13, "    pub color: ColorWhen,"),
-                MockDiffLine::add(14, "    pub quiet: bool,"),
-                MockDiffLine::ctx(14, 15, "}"),
+                MockDiffLine::ctx(10, 10, "pub fn parse(input: &str) -> Vec<&str> {"),
+                MockDiffLine::remove(11, "    input.split(' ').collect()"),
+                MockDiffLine::add(11, "    // Split input into tokens, collapsing whitespace."),
+                MockDiffLine::add(12, "    input.split_whitespace().collect()"),
+                MockDiffLine::ctx(12, 13, "}"),
             ],
         },
         MockEvologEntry {
-            commit_id: "9f8e7d6c5b4a".into(),
-            operation: "squash into parent".into(),
-            time: "2026-06-19 13:47:55".into(),
-            file_path: "src/flags.rs".into(),
-            current: false,
-            origin: false,
-            diff: vec![
-                MockDiffLine::ctx(4, 4, "use crate::color::ColorWhen;"),
-                MockDiffLine::ctx(5, 5, ""),
-                MockDiffLine::add(6, "/// Parsed command-line flags."),
-                MockDiffLine::ctx(6, 7, "pub struct Flags {"),
-                MockDiffLine::remove(7, "    pub v: bool,"),
-                MockDiffLine::add(8, "    pub verbose: bool,"),
-            ],
-        },
-        MockEvologEntry {
-            commit_id: "1a2b3c4d5e6f".into(),
-            operation: "rebase -d main".into(),
-            time: "2026-06-19 13:30:02".into(),
-            file_path: "src/flags.rs".into(),
-            current: false,
-            origin: false,
-            // Metadata-only step (rebase moved the commit but the tree is
-            // unchanged relative to its new predecessor) — empty inter-diff.
-            diff: vec![],
-        },
-        MockEvologEntry {
-            commit_id: "0099aabbccdd".into(),
-            operation: "new commit".into(),
-            time: "2026-06-19 13:28:40".into(),
-            file_path: "src/flags.rs".into(),
+            commit_id: "0b82e5dc4c1c".into(),
+            operation: "commit 512551c95fd4a7d7b935d1652b606102e6914534".into(),
+            time: "2026-01-15 10:00:00".into(),
+            file_path: "src/parser.rs".into(),
             current: false,
             origin: true,
             diff: vec![],
@@ -159,9 +134,10 @@ pub fn mock_entries() -> Vec<MockEvologEntry> {
 }
 
 /// The change-id of the inspected revision (lightjj's header `.header-change-id`,
-/// amber). Stub. INTEGRATION: the change-id of the selected revision.
+/// amber). Matches the fixture `@`'s change-id (12 chars). Stub. INTEGRATION:
+/// the change-id of the selected revision.
 pub fn mock_change_id() -> &'static str {
-    "qpvuntsmwlrt"
+    "lklqykmzmopp"
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +149,7 @@ const HEADER_H: f64 = jjscratch::theme::layout::PANEL_HEADER_H;
 /// `.evolog-entry` / `.panel-header` horizontal padding.
 const PAD_X: f64 = 12.0;
 /// `.entry-id` fixed column width (lightjj `width: 96px`).
-const ID_COL_W: f64 = 100.0;
+const ID_COL_W: f64 = 96.0;
 /// Entry-header row height (commit-id / operation / time). `.evolog-entry` is
 /// --fs-md over ~1.4 line-height plus 2×4px padding ≈ 26px.
 const ENTRY_H: f64 = 26.0;
@@ -237,18 +213,17 @@ pub fn render(
             scene, &ctx.fonts.mono_bold, font::FS_SM, t.amber,
             kx + 6.0, baseline_for(hcy, font::FS_SM, &ctx.fonts.mono_bold), &id12,
         );
-        // `.entry-count` ("· N entries") in faint text.
+        // `.entry-count` ("· N entries") — lightjj uses `--subtext0`, not faint.
         let label = if entries.len() == 1 { "entry" } else { "entries" };
         let count = format!(" \u{00b7} {} {label}", entries.len());
         text::draw_text(
-            scene, &ctx.fonts.ui, font::FS_SM, t.text_faint,
+            scene, &ctx.fonts.ui, font::FS_SM, t.subtext0,
             kx + 4.0, baseline_for(hcy, font::FS_SM, &ctx.fonts.ui), &count,
         );
     }
-    // Right-aligned count badge (`.panel-badge`).
-    if !entries.is_empty() {
-        draw_count_badge(scene, header, entries.len(), ctx);
-    }
+    // Right-aligned panel actions (`.panel-actions`): ghost `Refresh` / `Close`
+    // buttons, exactly like lightjj's EvologPanel header (not a count badge).
+    draw_panel_actions(scene, header, ctx);
 
     // --- Entries: each a header row + its inline inter-diff snippet ---------
     let mut y = header.y1;
@@ -285,12 +260,10 @@ fn entry_block(
 
     // --- Entry header row -------------------------------------------------
     let row = Rect::new(rect.x0, y, rect.x1, (y + ENTRY_H).min(rect.y1));
-    // The current (newest) entry gets the `.selected` tint (lightjj auto-selects
-    // entry 0 on open). Origin entries dim (`.origin` opacity 0.6) — we lean on
-    // faint text for that instead of layer alpha.
-    if entry.current {
-        fill_rect(scene, row, t.bg_checked);
-    }
+    // lightjj's EvologPanel opens with the cursor at -1 (nothing selected), so
+    // NO row gets the `.selected` (--bg-checked) tint — the reference confirms a
+    // flat entry list. `.current` only paints the id amber (handled below);
+    // `.origin` dims via faint text. Only the subtle border-bottom separates rows.
     border_bottom(scene, row, t.bg_hunk_header);
     let cy = row.center().y;
 
@@ -478,19 +451,31 @@ fn nav_hint_kbd(scene: &mut Scene, x: f64, cy: f64, key: &str, ctx: &RenderCtx) 
     chip.x1
 }
 
-/// Right-aligned count pill (`.panel-badge`): bg --surface0, color --subtext0,
-/// padding 0 6, radius 8, --fs-xs.
-fn draw_count_badge(scene: &mut Scene, header: Rect, n: usize, ctx: &RenderCtx) {
-    let t = ctx.theme;
+/// Right-aligned panel actions (`.panel-actions`): ghost `.btn`s — `Refresh`
+/// then `Close` — matching lightjj's EvologPanel header (bg transparent, 1px
+/// --surface1 border, radius 4, --subtext0, padding 3px 10px, --fs-sm, 8px gap).
+fn draw_panel_actions(scene: &mut Scene, header: Rect, ctx: &RenderCtx) {
     let cy = header.center().y;
-    let s = n.to_string();
-    let bsz = font::FS_XS;
-    let tw = text::measure(&ctx.fonts.ui_bold, bsz, &s) as f64;
-    let bw = tw + 6.0 * 2.0;
-    let pill = Rect::new(header.x1 - PAD_X - bw, cy - 8.0, header.x1 - PAD_X, cy + 8.0);
-    fill_round(scene, pill, 8.0, t.surface0);
+    // Right-anchored, Close outermost then Refresh to its left (8px gap).
+    let mut x_right = header.x1 - PAD_X;
+    for label in ["Close", "Refresh"] {
+        x_right = ghost_btn(scene, x_right, cy, label, ctx) - 8.0;
+    }
+}
+
+/// A ghost `.btn` (rounded, 1px --surface1 border, --subtext0 text) right-anchored
+/// at `x_right`. Returns its left edge.
+fn ghost_btn(scene: &mut Scene, x_right: f64, cy: f64, label: &str, ctx: &RenderCtx) -> f64 {
+    let t = ctx.theme;
+    let sz = font::FS_SM;
+    let lw = text::measure(&ctx.fonts.ui, sz, label) as f64;
+    let pad = 10.0;
+    let w = lw + pad * 2.0;
+    let r = Rect::new(x_right - w, cy - 10.0, x_right, cy + 10.0);
+    stroke_round(scene, r, 4.0, t.surface1, 1.0);
     text::draw_text(
-        scene, &ctx.fonts.ui_bold, bsz, t.subtext0,
-        pill.x0 + 6.0, baseline_for(cy, bsz, &ctx.fonts.ui_bold), &s,
+        scene, &ctx.fonts.ui, sz, t.subtext0,
+        r.x0 + pad, baseline_for(cy, sz, &ctx.fonts.ui), label,
     );
+    r.x0
 }
