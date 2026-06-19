@@ -210,12 +210,24 @@ pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
         let is_immutable = immutable.get(commit_id).copied().unwrap_or(false);
         let is_divergent = divergent.get(commit_id).copied().unwrap_or(false);
 
+        // "Empty" = no file changes vs the (first) parent — NOT an empty
+        // description. Root (no parent) is empty by convention.
+        let is_empty = match commit.parent_ids().first() {
+            None => true,
+            Some(pid) => match store.get_commit(pid) {
+                Ok(parent) => commit.tree_ids() == parent.tree_ids(),
+                Err(_) => false,
+            },
+        };
+
         out_nodes.push(CommitNode {
-            change_id: change_id.hex(),
+            // jj displays change ids in its reverse-hex (z-k) alphabet, not raw
+            // hex — e.g. "lxtsspsu", not "e2677a75".
+            change_id: change_id.reverse_hex(),
             change_prefix_len,
             commit_id: commit_id.hex(),
             commit_prefix_len,
-            is_empty: description.trim().is_empty(),
+            is_empty,
             description,
             author_name: author.name.clone(),
             author_email: author.email.clone(),
@@ -603,11 +615,19 @@ mod tests {
         assert_eq!(snap.workspace_name, "default");
         assert_eq!(snap.repo_name, "repo");
 
-        // Working copy: empty description, flagged.
+        // Working copy: empty description, flagged, NOT empty (has live edits:
+        // src/main.rs modified, src/parser.rs deleted).
         let wc = snap.working_copy().expect("working-copy node present");
         assert!(wc.is_working_copy);
         assert!(wc.description.is_empty(), "wc description should be empty");
-        assert!(wc.is_empty);
+        assert!(!wc.is_empty, "wc has file changes, so it is not empty");
+        // change_id is rendered in jj's reverse-hex alphabet (z-k), e.g. starts
+        // with a letter, never a hex digit.
+        assert!(
+            wc.change_id.chars().next().is_some_and(|c| ('k'..='z').contains(&c)),
+            "change_id should be reverse-hex (got {:?})",
+            wc.change_id,
+        );
         assert_eq!(snap.wc_commit_id.as_deref(), Some(wc.commit_id.as_str()));
 
         // feat: immutable, carries the `main` local bookmark.

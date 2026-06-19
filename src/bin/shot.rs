@@ -56,7 +56,15 @@ fn main() -> Result<()> {
     let fonts = Fonts::bundled();
     let palette = theme::DARK;
     let ctx = RenderCtx { fonts: &fonts, theme: &palette };
-    let state = UiState::default();
+    // Default the cursor to the working copy so the RevisionHeader/diff (which
+    // currently shows the working-copy diff) and the selected row agree,
+    // regardless of jj-lib's topological stream order.
+    let mut state = UiState::default();
+    state.selected = snapshot
+        .nodes
+        .iter()
+        .position(|n| n.is_working_copy)
+        .unwrap_or(0);
 
     let mut scene = Scene::new();
     ui::build_scene(
