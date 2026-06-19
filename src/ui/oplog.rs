@@ -78,12 +78,14 @@ pub fn render(scene: &mut Scene, rect: Rect, ops: &[OpEntry], ctx: &RenderCtx) {
     // Nav hints (`j` `k` `Enter`) like the lightjj panel title.
     let mut kx = title_end + 6.0;
     for key in ["j", "k", "Enter"] {
-        kx = nav_hint_kbd(scene, kx, hcy, key, ctx) + 2.0;
+        kx = nav_hint_kbd(scene, kx, hcy, key, ctx) + 1.0;
     }
-    // Right-aligned count badge (`.panel-badge`).
-    if !ops.is_empty() {
-        draw_count_badge(scene, header, ops.len(), ctx);
-    }
+    // Right-aligned action buttons (`.panel-actions`: ghost `.btn`s). lightjj's
+    // OplogPanel header carries "Refresh" and "Close" buttons here, not a count
+    // badge. They are static (jjscratch has no interactivity yet) but reproduce
+    // the reference chrome. Drawn right-to-left so each anchors its right edge.
+    let close_x0 = draw_btn(scene, header.x1 - PAD_X, hcy, "Close", ctx);
+    draw_btn(scene, close_x0 - 8.0, hcy, "Refresh", ctx);
 
     // --- Rows -------------------------------------------------------------
     let mut y = header.y1;
@@ -189,20 +191,25 @@ fn nav_hint_kbd(scene: &mut Scene, x: f64, cy: f64, key: &str, ctx: &RenderCtx) 
     chip.x1
 }
 
-/// Right-aligned count pill (`.panel-badge`): bg --surface0, color --subtext0,
-/// padding 0 6, radius 8, --fs-xs.
-fn draw_count_badge(scene: &mut Scene, header: Rect, n: usize, ctx: &RenderCtx) {
+/// A right-anchored ghost button (`.btn`): transparent bg, 1px --surface1
+/// border, radius 4, padding `3px 10px`, --subtext0 label at --fs-sm. `x1` is
+/// the button's right edge; returns its left edge x so the caller can stack the
+/// next button leftward with a gap.
+fn draw_btn(scene: &mut Scene, x1: f64, cy: f64, label: &str, ctx: &RenderCtx) -> f64 {
     let t = ctx.theme;
-    let cy = header.center().y;
-    let s = n.to_string();
-    let bsz = font::FS_XS;
-    let tw = text::measure(&ctx.fonts.ui_bold, bsz, &s) as f64;
-    let bw = tw + 6.0 * 2.0;
-    let pill = Rect::new(header.x1 - PAD_X - bw, cy - 8.0, header.x1 - PAD_X, cy + 8.0);
-    crate::ui::fill_round(scene, pill, 8.0, t.surface0);
+    let sz = font::FS_SM;
+    let tw = text::measure(&ctx.fonts.ui, sz, label) as f64;
+    let pad_x = 10.0;
+    let bw = tw + pad_x * 2.0;
+    let x0 = x1 - bw;
+    // `.btn` height: padding 3px×2 + fs-sm·line-height(1.4) ≈ 23px.
+    let half_h = 11.5;
+    let btn = Rect::new(x0, cy - half_h, x1, cy + half_h);
+    crate::ui::stroke_round(scene, btn, 4.0, t.surface1, 1.0);
     text::draw_text(
-        scene, &ctx.fonts.ui_bold, bsz, t.subtext0,
-        pill.x0 + 6.0, baseline_for(cy, bsz, &ctx.fonts.ui_bold), &s,
+        scene, &ctx.fonts.ui, sz, t.subtext0,
+        x0 + pad_x, baseline_for(cy, sz, &ctx.fonts.ui), label,
     );
+    x0
 }
 } // mod imp
