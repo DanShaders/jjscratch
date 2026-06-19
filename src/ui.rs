@@ -244,11 +244,13 @@ fn draw_toolbar(
     x = toolbar_divider(scene, x, bar, t) + TOOLBAR_GAP;
 
     // 5. Nav tabs = a `.seg` segmented control with three `.seg-btn`.
-    // Icon + word kept separate so the icon can be drawn from whichever bundled
-    // font covers the glyph (Inter lacks ◉/⑂/⧉/⟲/◐; see `icon_font`).
+    // Icon + word kept separate so the icon gets its own metric-centered baseline
+    // (it resolves in a symbol fallback font with different vertical metrics than
+    // Inter; see `draw_icon_label`). Codepoints match lightjj's toolbar markup
+    // (App.svelte): ◉ Revisions, ⑂ Branches (U+2442), ⧉ Merge.
     let tabs = [
         ("\u{25c9}", "Revisions", "1", View::Revisions),
-        ("\u{2942}", "Branches", "2", View::Branches),
+        ("\u{2442}", "Branches", "2", View::Branches),
         ("\u{29c9}", "Merge", "3", View::Merge),
     ];
     x = seg_control(scene, x, bar, &tabs, state.active_view, ctx) + TOOLBAR_GAP;
@@ -267,13 +269,15 @@ fn draw_toolbar(
     // 9. Search button (`Search…` + ⌘K/Ctrl+K kbd chip).
     search_button(scene, x, bar, ctx);
 
-    // Right group (space-between): theme toggle glyph at the far right.
+    // Right group (space-between): theme toggle glyph at the far right. lightjj
+    // shows ☀ (U+2600) in dark mode / ● in light mode; we render the dark-mode ☀.
     let sun = "\u{2600}";
     let sun_sz = theme::font::BASE;
     let tw = text::measure(&ctx.fonts.ui, sun_sz, sun) as f64;
     text::draw_text(
         scene, &ctx.fonts.ui, sun_sz, t.subtext0,
-        bar.x1 - TOOLBAR_PAD_X - 6.0 - tw, baseline_for(cy, sun_sz, &ctx.fonts.ui), sun,
+        bar.x1 - TOOLBAR_PAD_X - 6.0 - tw,
+        text::icon_baseline(&ctx.fonts.ui, sun_sz, '\u{2600}', cy), sun,
     );
 }
 
@@ -506,30 +510,25 @@ fn nav_hint_kbd(scene: &mut Scene, x: f64, cy: f64, key: &str, color: Color, ctx
     chip.x1
 }
 
-/// Pick the bundled font that covers `glyph` (so symbol icons aren't drawn as
-/// Inter's tall tofu box). JetBrains Mono covers a few symbol glyphs Inter
-/// lacks (e.g. `◉`, `◇`, `▾`, `▪`); fall back to the UI font otherwise. (The
-/// remaining nav icons `⑂ ⧉ ⟲ ◐` exist in no bundled font and will tofu — that
-/// needs a glyph added to assets/fonts, which is out of this module's scope.)
-fn icon_font<'a>(glyph: &str, bold: bool, ctx: &'a RenderCtx) -> &'a vello::peniko::FontData {
-    const MONO_COVERED: &[&str] = &["\u{25c9}", "\u{25c7}", "\u{25be}", "\u{25aa}"];
-    if MONO_COVERED.contains(&glyph) {
-        &ctx.fonts.mono
-    } else if bold {
-        &ctx.fonts.ui_bold
-    } else {
-        &ctx.fonts.ui
-    }
+/// The font a nav icon is drawn *with*. All toolbar icons (`◉ ⑂ ⧉ ⟲ ◐ ◇ …`) are
+/// missing from Inter and JetBrains Mono, so `text::draw_text` resolves them
+/// through the symbol fallback chain (Noto Sans Math / Symbols 2) regardless of
+/// which font we name here — the named font is only the *primary* of that chain.
+/// We pass the UI font (matching the label's weight) so a single `draw_text` of
+/// `"icon word"` would resolve consistently; the icon and word are drawn
+/// separately only so the icon can take its own metric-centered baseline.
+fn icon_font<'a>(bold: bool, ctx: &'a RenderCtx) -> &'a vello::peniko::FontData {
+    if bold { &ctx.fonts.ui_bold } else { &ctx.fonts.ui }
 }
 
 /// Gap between a nav icon glyph and its following word.
 const ICON_LABEL_GAP: f64 = 3.0;
 
-/// Width of an `icon word` run (icon in its covering font, word in the UI font).
+/// Width of an `icon word` run (icon resolved via the fallback chain, word in
+/// the UI font).
 fn icon_label_w(icon: &str, word: &str, sz: f32, bold: bool, ctx: &RenderCtx) -> f64 {
-    let ifont = icon_font(icon, bold, ctx);
-    let wfont = if bold { &ctx.fonts.ui_bold } else { &ctx.fonts.ui };
-    text::measure(ifont, sz, icon) as f64 + ICON_LABEL_GAP + text::measure(wfont, sz, word) as f64
+    let font = icon_font(bold, ctx);
+    text::measure(font, sz, icon) as f64 + ICON_LABEL_GAP + text::measure(font, sz, word) as f64
 }
 
 /// Draw an `icon word` run at `x`, baseline-centered on `cy`. Returns end x.
@@ -544,11 +543,15 @@ fn draw_icon_label(
     bold: bool,
     ctx: &RenderCtx,
 ) -> f64 {
-    let ifont = icon_font(icon, bold, ctx);
-    let wfont = if bold { &ctx.fonts.ui_bold } else { &ctx.fonts.ui };
-    let ix = text::draw_text(scene, ifont, sz, color, x, baseline_for(cy, sz, ifont), icon)
+    let font = icon_font(bold, ctx);
+    // Icon: center its real ink box (resolved in whatever fallback font draws it)
+    // on `cy` — symbol fonts' line metrics don't match Inter's, so the plain
+    // `baseline_for` would leave the glyph high or low. The word keeps Inter's
+    // line-box baseline so the Latin label still aligns with the rest of the bar.
+    let iglyph = icon.chars().next().unwrap_or(' ');
+    let ix = text::draw_text(scene, font, sz, color, x, text::icon_baseline(font, sz, iglyph, cy), icon)
         + ICON_LABEL_GAP;
-    text::draw_text(scene, wfont, sz, color, ix, baseline_for(cy, sz, wfont), word)
+    text::draw_text(scene, font, sz, color, ix, baseline_for(cy, sz, font), word)
 }
 
 /// Nav-tab segmented control (`.seg` wrapping three `.seg-btn`). One outer
@@ -635,9 +638,11 @@ fn workspace_pill(scene: &mut Scene, x: f64, bar: Rect, name: &str, ctx: &Render
     stroke_round(scene, pill, 4.0, t.surface1, 1.0);
 
     let mut tx = x + NAV_BTN_PAD_X;
+    // ◇ ink-box centered (its symbol-font metrics differ from the mono line box).
+    let gchar = glyph.chars().next().unwrap_or(' ');
     tx = text::draw_text(
         scene, &ctx.fonts.mono, theme::font::FS_XS, t.subtext0,
-        tx, baseline_for(cy, theme::font::FS_XS, &ctx.fonts.mono), glyph,
+        tx, text::icon_baseline(&ctx.fonts.mono, theme::font::FS_XS, gchar, cy), glyph,
     ) + 6.0;
     text::draw_text(
         scene, &ctx.fonts.mono, sz, t.text,
