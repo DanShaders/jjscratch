@@ -21,7 +21,7 @@ use jj_lib::commit::Commit;
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::conflicts::{materialize_tree_value, MaterializedTreeValue};
 use jj_lib::config::StackedConfig;
-use jj_lib::graph::GraphEdgeType;
+use jj_lib::graph::{GraphEdgeType, TopoGroupedGraph};
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
@@ -143,21 +143,49 @@ fn collect_membership(
     Ok(out)
 }
 
-/// Build a full [`Snapshot`] by streaming `all()` in topological order
-/// (children before parents) and turning each graph node into a [`CommitNode`].
+/// Build a full [`Snapshot`] by streaming `all()` and turning each graph node
+/// into a [`CommitNode`], ordered to match `jj log`'s default output.
+///
+/// # Ordering
+///
+/// jj-lib's `Revset::stream_graph` yields nodes in *descending index position*
+/// (children before parents, but heads are interleaved purely by insertion
+/// position). For our fixture that puts the side branch `experiment` first,
+/// which does not match `jj log` / lightjj.
+///
+/// jj's CLI does not render that raw stream; it feeds it through
+/// [`jj_lib::graph::TopoGroupedGraph`], which DFS-groups each topological branch
+/// so a branch is emitted contiguously (fork descendants visited at the fork,
+/// merge ancestors visited last-first — the same shape Git uses). We do the
+/// same here, and additionally call `prioritize_branch(working_copy)` so the
+/// branch containing `@` (the working copy and its ancestors) is emitted before
+/// any other head. That reproduces lightjj's default-log order exactly:
+/// `@`, wip, refactor, then the `experiment` fork interleaved at its branch
+/// point, then feat[main], docs, init, root.
+///
+/// Re-grouping only changes the node *sequence*; each node keeps its original
+/// parent edges from `stream_graph`, so the DAG/lane layout is unchanged.
 pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
     let repo = loaded.repo.as_ref();
     let store = repo.store();
     let view = repo.view();
 
-    // 1. Stream the DAG: (CommitId, edges) in topological order.
+    // 1. Stream the DAG: (CommitId, edges) in jj-log order.
     let all: Arc<ResolvedRevsetExpression> = RevsetExpression::all();
     let revset = all
         .evaluate(repo)
         .map_err(|e| anyhow!("evaluating all(): {e}"))?;
 
     let graph_nodes: Vec<(CommitId, Vec<(CommitId, EdgeType)>)> = pollster::block_on(async {
-        let mut stream = revset.stream_graph();
+        // Re-group the topological stream into contiguous branches (jj's CLI
+        // log ordering), prioritizing the working-copy branch so `@` and its
+        // ancestors are emitted first.
+        let mut topo = TopoGroupedGraph::new(revset.stream_graph(), |id: &CommitId| id);
+        if let Some(wc_id) = &loaded.wc_commit_id {
+            topo.prioritize_branch(wc_id.clone());
+        }
+        let mut stream = std::pin::pin!(topo.stream());
+
         let mut nodes = Vec::new();
         while let Some(node) = stream.next().await {
             let (commit_id, edges) = node.map_err(|e| anyhow!("graph stream: {e}"))?;
@@ -610,10 +638,33 @@ mod tests {
         let loaded = open(&fixture_path()).expect("open fixture");
         let snap = snapshot(&loaded).expect("snapshot");
 
-        // 8 revisions: @, wip, refactor, experiment, feat, docs, init, root.
+        // 8 revisions in jj-log order: @, wip, refactor, experiment (fork),
+        // feat[main], docs, init, root.
         assert_eq!(snap.nodes.len(), 8, "expected 8 revisions");
         assert_eq!(snap.workspace_name, "default");
         assert_eq!(snap.repo_name, "repo");
+
+        // Ordering: the working copy must be first (jj prioritizes the
+        // working-copy branch), and the side branch `experiment` must come
+        // after `refactor` and at/before `feat` (it forks off `feat`).
+        assert!(
+            snap.nodes[0].is_working_copy,
+            "first node should be the working copy"
+        );
+        let pos = |pred: &dyn Fn(&CommitNode) -> bool| {
+            snap.nodes.iter().position(|n| pred(n)).expect("node present")
+        };
+        let refactor_pos = pos(&|n| n.description.starts_with("refactor"));
+        let experiment_pos = pos(&|n| n.bookmarks.iter().any(|b| b.name == "experiment"));
+        let feat_pos = pos(&|n| n.description.starts_with("feat:"));
+        assert!(
+            refactor_pos < experiment_pos,
+            "experiment ({experiment_pos}) should come after refactor ({refactor_pos})"
+        );
+        assert!(
+            experiment_pos <= feat_pos,
+            "experiment ({experiment_pos}) should come at or before feat ({feat_pos})"
+        );
 
         // Working copy: empty description, flagged, NOT empty (has live edits:
         // src/main.rs modified, src/parser.rs deleted).
