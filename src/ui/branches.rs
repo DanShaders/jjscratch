@@ -52,14 +52,20 @@ const ROW_H: f64 = 34.0;
 const FOOTER_H: f64 = 28.0;
 /// Horizontal content inset (`.bp-header`/`.bp-row` padding-left 16px).
 const PAD_X: f64 = 16.0;
-/// Bookmark rows are indented past the group chevron (`.bp-bookmark-row` 28px).
+/// Bookmark rows are indented past the group chevron (`.bp-bookmark-row`
+/// `padding-left:28px`). The 8px sync dot sits at the very start of this inset.
 const ROW_INDENT: f64 = 28.0;
 
-/// Column x-offsets within a bookmark row, panel-relative. The name column is
-/// fixed-width (`.bp-name` 200px in lightjj, scaled down to fit our narrower
-/// reference panel), then the sync label, then the commit column flex-fills.
-const SYNC_COL_X: f64 = 150.0; // start of the sync-label column
-const COMMIT_COL_X: f64 = 270.0; // start of the commit (id + description) column
+/// Column x-offsets within a bookmark row, panel-relative, derived exactly from
+/// lightjj's flex layout: `.bp-bookmark-row` is `padding-left:28px` over a
+/// `gap:14px` flex row of `[dot 8px][name 200px][sync 100px][commits flex]`:
+///   dot.x0    = 28               (8px dot → center 32)
+///   name.x0   = 28 + 8 + 14      = 50
+///   sync.x0   = 50 + 200 + 14    = 264
+///   commit.x0 = 264 + 100 + 14   = 378
+const NAME_COL_X: f64 = 50.0; // start of the bookmark-name column (`.bp-name`)
+const SYNC_COL_X: f64 = 264.0; // start of the sync-label column (`.bp-sync`)
+const COMMIT_COL_X: f64 = 378.0; // start of the commit (id + description) column
 const AGE_COL_W: f64 = 44.0; // right-anchored relative-age column width
 
 /// One presentational row in the panel: a group header or a bookmark.
@@ -254,13 +260,20 @@ fn header(scene: &mut Scene, rect: Rect, ctx: &RenderCtx, count: usize) -> f64 {
 
     // Sort segmented control (`.bp-sort`): Priority active (amber), then Recent,
     // Name. Sits just left of the count pill.
+    // `.seg-btn`: `padding:3px 10px`, fs-sm. Active button gets `bg-active`
+    // fill + amber text at weight 600; inactive buttons are `subtext0`.
     let modes = ["Priority", "Recent", "Name"];
     let ssz = font::FS_SM;
-    let seg_pad = 8.0;
-    let seg_h = 20.0;
+    let seg_pad = 10.0;
+    let seg_h = 22.0; // 3px padding top/bottom over an fs-sm cap line
     let widths: Vec<f64> = modes
         .iter()
-        .map(|m| text::measure(&ctx.fonts.ui, ssz, m) as f64 + seg_pad * 2.0)
+        .enumerate()
+        .map(|(i, m)| {
+            // The active label is bold (weight 600), so it measures wider.
+            let f = if i == 0 { &ctx.fonts.ui_bold } else { &ctx.fonts.ui };
+            text::measure(f, ssz, m) as f64 + seg_pad * 2.0
+        })
         .collect();
     let seg_total: f64 = widths.iter().sum();
     let seg_x0 = pill.x0 - 12.0 - seg_total;
@@ -272,15 +285,15 @@ fn header(scene: &mut Scene, rect: Rect, ctx: &RenderCtx, count: usize) -> f64 {
         let w = widths[i];
         let active = i == 0; // "Priority" is the default sort mode
         let btn = Rect::new(sx, seg_box.y0, sx + w, seg_box.y1);
-        let color = if active {
+        let (font, color) = if active {
             fill_round(scene, btn, 4.0, t.bg_active);
-            t.amber
+            (&ctx.fonts.ui_bold, t.amber)
         } else {
-            t.subtext0
+            (&ctx.fonts.ui, t.subtext0)
         };
         text::draw_text(
-            scene, &ctx.fonts.ui, ssz, color,
-            sx + seg_pad, baseline_for(cy, ssz, &ctx.fonts.ui), m,
+            scene, font, ssz, color,
+            sx + seg_pad, baseline_for(cy, ssz, font), m,
         );
         sx += w;
     }
@@ -355,9 +368,9 @@ fn bookmark_row(
     let r = Rect::new(rect.x0, y, rect.x1, y + ROW_H);
     let cy = r.center().y;
 
-    // Sync dot (`.bp-dot`), 8px, color/hollow per sync state.
+    // Sync dot (`.bp-dot`), 8px, at the start of the row inset (center 32).
     let dot_r = 4.0;
-    let dot_cx = r.x0 + ROW_INDENT - 2.0;
+    let dot_cx = r.x0 + ROW_INDENT + dot_r;
     let dot = Rect::new(dot_cx - dot_r, cy - dot_r, dot_cx + dot_r, cy + dot_r);
     if sync.hollow() {
         stroke_round(scene, dot, dot_r, sync.dot(t), 1.0);
@@ -366,7 +379,7 @@ fn bookmark_row(
     }
 
     // Name (`.bp-name`, weight 500).
-    let name_x = r.x0 + ROW_INDENT + 12.0;
+    let name_x = r.x0 + NAME_COL_X;
     let nsz = font::FS_MD;
     text::draw_text(
         scene, &ctx.fonts.ui_bold, nsz, t.text,
@@ -416,12 +429,13 @@ fn bookmark_row(
         // for others' commits + filterable via `author:`) would sit just left of
         // the age — omitted here because the fixture is single-author and the
         // per-ref author the panel shows isn't surfaced distinctly in the model.
+        // `.bp-ago`: faint, right-anchored, with a 4px `margin-right`.
         let age = relative_age(node.timestamp_ms);
         let asz = font::FS_XS;
         let aw = text::measure(&ctx.fonts.ui, asz, &age) as f64;
         text::draw_text(
             scene, &ctx.fonts.ui, asz, t.text_faint,
-            r.x1 - PAD_X - aw, baseline_for(cy, asz, &ctx.fonts.ui), &age,
+            r.x1 - PAD_X - 4.0 - aw, baseline_for(cy, asz, &ctx.fonts.ui), &age,
         );
     } else {
         // No host commit found (shouldn't happen for the fixture).
