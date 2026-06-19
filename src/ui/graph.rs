@@ -1,94 +1,411 @@
-//! Revision graph renderer (the left panel).
+//! Revision graph renderer (the left "REVISIONS" panel).
 //!
-//! STATUS: PLACEHOLDER. This draws a simplified one-row-per-commit list so the
-//! frame composes. The real implementation must reproduce lightjj's GraphSvg
-//! pixel-for-pixel (docs/spec/ui-spec.md §4): flattened 18px rows (node line +
-//! optional bookmark line + description/meta line), the lane gutter with
-//! vertical/horizontal/elbow connectors computed from the DAG edges (use
-//! [`crate::graph_layout`]), node glyphs (@ amber concentric ring, ○ filled
-//! lane-colored, ◆ dimmed diamond for immutable, × conflict, ◌ hidden), change-id
-//! prefix highlighting, bookmark badges, immutable description dimming, and the
-//! selected (inset amber bar) / hovered / checked row states.
+//! Reproduces lightjj's GraphSvg + flattened-row model (docs/spec/ui-spec.md §4):
+//! every revision expands into a stack of fixed-18px rows — a node line (node
+//! glyph + role/alert badges + description), an optional bookmark line, and a
+//! meta line (change-id with amber prefix + faint tail, faint commit-id, author
+//! chip, relative timestamp). The lane gutter is drawn from
+//! [`crate::graph_layout`] connector cells so the pipes stay continuous across a
+//! revision's sub-rows. The `(elided revisions)` marker is rendered for elided
+//! (Indirect) parent edges.
 
-use vello::kurbo::{Affine, Circle, Rect};
-use vello::peniko::Fill;
+use vello::kurbo::{Affine, BezPath, Cap, Circle, Line, Point, Rect, Stroke};
+use vello::peniko::{Color, Fill};
 use vello::Scene;
 
-use super::{baseline, fill_rect, RenderCtx, UiState};
-use crate::model::Snapshot;
+use super::{baseline, fill_rect, fill_round, RenderCtx, UiState};
+use crate::graph_layout::{self, Cell, LayoutRow};
+use crate::model::{BookmarkKind, CommitNode, EdgeType, Snapshot};
 use crate::text;
-use crate::theme::{self, layout as L};
+use crate::theme::{self, font, layout as L, Palette};
+
+/// Fixed "now" for relative-time rendering: 2026-06-19 ≈ 1781913600000 ms.
+const NOW_MS: i64 = 1_781_913_600_000;
+
+/// One flattened display row tied to a revision.
+enum LineKind {
+    Node,
+    Bookmark,
+    Meta,
+    /// The `(elided revisions)` marker drawn after a revision with an elided edge.
+    Elided,
+}
 
 pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiState, ctx: &RenderCtx) {
     let t = ctx.theme;
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &rect);
 
-    let mut y = rect.y0 - state.graph_scroll;
+    let g = graph_layout::layout(&snapshot.nodes);
+
+    // Gutter geometry: the SVG starts after the 14px check-gutter; each lane is
+    // 20px wide (col*10), node center x = col*10 + 5 within the SVG box.
+    let gutter_x0 = rect.x0 + L::CHECK_GUTTER_W;
+    let gutter_cols = g.width_cols.clamp(1, L::MAX_GUTTER_COLS as usize);
+    let gutter_w = gutter_cols as f64 * L::CELL_W;
+    // lightjj leaves a comfortable gap between the gutter SVG and the row content.
+    let content_x = gutter_x0 + gutter_w + 12.0;
+
+    // Flatten: per revision, a node line, optional bookmark line, meta line; an
+    // elided marker row follows a revision whose first parent edge is Indirect.
+    let mut flat: Vec<(usize, LineKind)> = Vec::new();
     for (i, n) in snapshot.nodes.iter().enumerate() {
-        let row = Rect::new(rect.x0, y, rect.x1, y + L::ROW_H);
-
-        if i == state.selected {
-            fill_rect(scene, row, t.bg_selected);
-            fill_rect(scene, Rect::new(row.x0, row.y0, row.x0 + 2.0, row.y1), t.amber);
-        } else if state.hovered == Some(i) {
-            fill_rect(scene, row, t.bg_hover);
+        flat.push((i, LineKind::Node));
+        if !n.bookmarks.is_empty() {
+            flat.push((i, LineKind::Bookmark));
         }
-
-        // Node glyph in lane 0.
-        let cx = rect.x0 + L::CHECK_GUTTER_W + L::CELL_W * 0.5 + 4.0;
-        let cy = y + L::ROW_H * 0.5;
-        let lane = theme::with_opacity(t.graph[0], theme::GRAPH_NODE_OPACITY);
-        if n.is_working_copy {
-            scene.stroke(
-                &vello::kurbo::Stroke::new(1.8),
-                Affine::IDENTITY, t.amber, None, &Circle::new((cx, cy), L::WC_R + 1.0),
-            );
-            scene.fill(Fill::NonZero, Affine::IDENTITY, t.amber, None, &Circle::new((cx, cy), 2.5));
-        } else if n.is_immutable {
-            let dim = theme::with_opacity(t.graph[0], theme::GRAPH_IMMUTABLE_OPACITY);
-            let d = Rect::new(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5).to_rounded_rect(1.0);
-            let center = vello::kurbo::Point::new(cx, cy);
-            scene.fill(Fill::NonZero, Affine::rotate_about(0.785, center), dim, None, &d);
-        } else {
-            scene.fill(Fill::NonZero, Affine::IDENTITY, lane, None, &Circle::new((cx, cy), L::NODE_R));
-        }
-
-        // change-id (amber prefix + faint tail) + description.
-        let text_x = cx + 16.0;
-        let pfx = &n.change_id[..n.change_prefix_len.min(n.change_id.len())];
-        let end = text::draw_text(scene, &ctx.fonts.mono, theme::font::FS_SM, t.amber,
-            text_x, baseline(cy, theme::font::FS_SM), pfx);
-        let tail_end = n.change_id.len().min(12);
-        let tail = &n.change_id[n.change_prefix_len.min(tail_end)..tail_end];
-        let end = text::draw_text(scene, &ctx.fonts.mono, theme::font::FS_SM, t.text_faint,
-            end, baseline(cy, theme::font::FS_SM), tail);
-
-        let (desc, color) = if n.description.is_empty() {
-            ("(no description)".to_string(), t.overlay0)
-        } else {
-            let c = if n.is_immutable { t.overlay0 } else { t.text };
-            (n.description.clone(), c)
-        };
-        let mut dx = text::draw_text(scene, &ctx.fonts.ui, theme::font::FS_MD, color,
-            end + 10.0, baseline(cy, theme::font::FS_MD), &desc);
-
-        // bookmark badges (very rough).
-        for b in &n.bookmarks {
-            dx += 8.0;
-            let label = format!("\u{2942} {}", b.name);
-            let w = text::measure(&ctx.fonts.ui, theme::font::FS_XS, &label) as f64 + 10.0;
-            let badge = Rect::new(dx, cy - 8.0, dx + w, cy + 8.0).to_rounded_rect(3.0);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, t.surface0, None, &badge);
-            text::draw_text(scene, &ctx.fonts.ui, theme::font::FS_XS, t.subtext0,
-                dx + 5.0, baseline(cy, theme::font::FS_XS), &label);
-            dx += w;
-        }
-
-        y += L::ROW_H;
-        if y > rect.y1 {
-            break;
+        flat.push((i, LineKind::Meta));
+        let elided = n
+            .parents
+            .iter()
+            .find(|p| p.edge_type != EdgeType::Missing)
+            .map(|p| p.edge_type == EdgeType::Indirect)
+            .unwrap_or(false);
+        if elided {
+            flat.push((i, LineKind::Elided));
         }
     }
 
+    let mut y = rect.y0 - state.graph_scroll;
+    for (node_idx, line) in &flat {
+        let row = Rect::new(rect.x0, y, rect.x1, y + L::ROW_H);
+        if row.y1 < rect.y0 {
+            y += L::ROW_H;
+            continue;
+        }
+        if row.y0 > rect.y1 {
+            break;
+        }
+
+        let n = &snapshot.nodes[*node_idx];
+        let lrow = &g.rows[*node_idx];
+        let lane = lrow.lane;
+        let lane_c = lane_color(&t.graph, lane);
+        let selected = *node_idx == state.selected;
+        let hovered = state.hovered == Some(*node_idx) && !selected;
+
+        if selected {
+            fill_rect(scene, row, t.bg_selected);
+        } else if hovered {
+            fill_rect(scene, row, t.bg_hover);
+        }
+
+        // Gutter pipes for this sub-row (continuous across the revision's lines).
+        draw_cells(scene, gutter_x0, y, &lrow.cells, &t.graph);
+
+        // Node glyph on the node line only.
+        if matches!(line, LineKind::Node) {
+            let cx = node_center_x(gutter_x0, lrow);
+            let cy = y + L::ROW_H * 0.5;
+            draw_node(scene, cx, cy, n, t, lane_c);
+        }
+
+        // 2px amber inset bar for the selected revision (over the bg).
+        if selected {
+            fill_rect(scene, Rect::new(row.x0, row.y0, row.x0 + 2.0, row.y1), t.amber);
+        }
+
+        let cy = y + L::ROW_H * 0.5;
+        match line {
+            LineKind::Node => draw_node_line(scene, content_x, cy, n, t, ctx),
+            LineKind::Bookmark => draw_bookmark_line(scene, content_x, cy, n, t, ctx, lane_c),
+            LineKind::Meta => draw_meta_line(scene, content_x, cy, n, t, ctx),
+            LineKind::Elided => draw_elided(scene, content_x, rect.x1, y, t, ctx),
+        }
+
+        y += L::ROW_H;
+    }
+
     scene.pop_layer();
+}
+
+fn lane_color(graph: &[Color; 8], lane: usize) -> Color {
+    graph[lane % 8]
+}
+
+fn node_center_x(gx0: f64, lrow: &LayoutRow) -> f64 {
+    gx0 + lrow.node_col() as f64 * L::CELL_W + L::CELL_W * 0.5
+}
+
+// --- gutter ----------------------------------------------------------------
+
+fn draw_cells(scene: &mut Scene, gx0: f64, y: f64, cells: &[Cell], graph: &[Color; 8]) {
+    for (col, cell) in cells.iter().enumerate() {
+        // Lane color is keyed by the lane that the column belongs to (col/2).
+        let lane = col / 2;
+        draw_cell(scene, gx0, y, col, *cell, lane_color(graph, lane));
+    }
+}
+
+/// Draw one gutter cell. `col` is the character column, row top at `y`.
+fn draw_cell(scene: &mut Scene, gx0: f64, y: f64, col: usize, cell: Cell, color: Color) {
+    let cx = gx0 + col as f64 * L::CELL_W + L::CELL_W * 0.5;
+    let cy = y + L::ROW_H * 0.5;
+    let line_color = theme::with_opacity(color, theme::GRAPH_LINE_OPACITY);
+    let w = L::GRAPH_LINE_W;
+
+    match cell {
+        Cell::Empty => {}
+        Cell::Vertical => crisp_vline(scene, cx, y, y + L::ROW_H, line_color, w),
+        Cell::Elided => {
+            // Dashed vertical at lower opacity.
+            let c = theme::with_opacity(color, 0.3);
+            let stroke = Stroke::new(w).with_dashes(0.0, [2.0, 3.0]);
+            scene.stroke(&stroke, Affine::IDENTITY, c, None, &Line::new((cx, y), (cx, y + L::ROW_H)));
+        }
+        Cell::Horizontal => {
+            crisp_hline(scene, cx - L::CELL_W * 0.5, cx + L::CELL_W * 0.5, cy, line_color, w)
+        }
+        Cell::ElbowTopLeft
+        | Cell::ElbowTopRight
+        | Cell::ElbowBottomLeft
+        | Cell::ElbowBottomRight => draw_elbow(scene, cx, y, cell, line_color, w),
+    }
+}
+
+/// Quadratic-curve elbow through (cx, cy), round cap.
+fn draw_elbow(scene: &mut Scene, cx: f64, y: f64, cell: Cell, color: Color, w: f64) {
+    let cy = y + L::ROW_H * 0.5;
+    let top = y;
+    let bot = y + L::ROW_H;
+    let left = cx - L::CELL_W * 0.5;
+    let right = cx + L::CELL_W * 0.5;
+
+    let (start, end) = match cell {
+        Cell::ElbowTopLeft => (Point::new(cx, bot), Point::new(left, cy)), // ╮
+        Cell::ElbowTopRight => (Point::new(cx, bot), Point::new(right, cy)), // ╭
+        Cell::ElbowBottomLeft => (Point::new(cx, top), Point::new(left, cy)), // ╯
+        Cell::ElbowBottomRight => (Point::new(cx, top), Point::new(right, cy)), // ╰
+        _ => return,
+    };
+    let mut path = BezPath::new();
+    path.move_to(start);
+    path.quad_to(Point::new(cx, cy), end);
+    scene.stroke(&Stroke::new(w).with_caps(Cap::Round), Affine::IDENTITY, color, None, &path);
+}
+
+/// Crisp vertical line (snap x to integer center, `crispEdges` semantics).
+fn crisp_vline(scene: &mut Scene, x: f64, y0: f64, y1: f64, color: Color, w: f64) {
+    let x = x.round();
+    fill_rect(scene, Rect::new(x - w * 0.5, y0, x + w * 0.5, y1), color);
+}
+
+fn crisp_hline(scene: &mut Scene, x0: f64, x1: f64, y: f64, color: Color, w: f64) {
+    let y = y.round();
+    fill_rect(scene, Rect::new(x0, y - w * 0.5, x1, y + w * 0.5), color);
+}
+
+// --- node glyphs -----------------------------------------------------------
+
+fn draw_node(scene: &mut Scene, cx: f64, cy: f64, n: &CommitNode, t: &Palette, lane: Color) {
+    // Two short lane segments above/below the glyph (NODE_GAP gap), at line opacity.
+    let line_c = theme::with_opacity(lane, theme::GRAPH_LINE_OPACITY);
+    let top = cy - L::ROW_H * 0.5;
+    let bot = cy + L::ROW_H * 0.5;
+    crisp_vline(scene, cx, top, cy - L::NODE_GAP, line_c, L::GRAPH_LINE_W);
+    crisp_vline(scene, cx, cy + L::NODE_GAP, bot, line_c, L::GRAPH_LINE_W);
+
+    let node_c = theme::with_opacity(lane, theme::GRAPH_NODE_OPACITY);
+
+    // Divergent: extra dashed ring around any node.
+    if n.is_divergent {
+        let ring = theme::with_opacity(lane, 0.5);
+        let stroke = Stroke::new(1.0).with_dashes(0.0, [2.0, 2.0]);
+        scene.stroke(&stroke, Affine::IDENTITY, ring, None, &Circle::new((cx, cy), L::NODE_R + 3.0));
+    }
+
+    if n.has_conflict {
+        scene.fill(Fill::NonZero, Affine::IDENTITY, t.red, None, &Circle::new((cx, cy), L::WC_R));
+        let s = Stroke::new(1.5);
+        let d = 2.4;
+        scene.stroke(&s, Affine::IDENTITY, t.base, None, &Line::new((cx - d, cy - d), (cx + d, cy + d)));
+        scene.stroke(&s, Affine::IDENTITY, t.base, None, &Line::new((cx - d, cy + d), (cx + d, cy - d)));
+    } else if n.is_working_copy {
+        // Amber concentric ring: outer stroke r=WC_R+1 width 1.8 + inner dot r=2.5.
+        scene.stroke(&Stroke::new(1.8), Affine::IDENTITY, t.amber, None, &Circle::new((cx, cy), L::WC_R + 1.0));
+        scene.fill(Fill::NonZero, Affine::IDENTITY, t.amber, None, &Circle::new((cx, cy), 2.5));
+    } else if n.is_hidden {
+        let c = theme::with_opacity(lane, 0.35);
+        scene.stroke(&Stroke::new(1.2), Affine::IDENTITY, c, None, &Circle::new((cx, cy), L::NODE_R - 0.5));
+    } else if n.is_immutable {
+        // 7x7 rounded rect rotated 45° (diamond), dimmer (opacity 0.5).
+        let dim = theme::with_opacity(lane, theme::GRAPH_IMMUTABLE_OPACITY);
+        let d = Rect::new(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5).to_rounded_rect(1.0);
+        scene.fill(
+            Fill::NonZero,
+            Affine::rotate_about(std::f64::consts::FRAC_PI_4, Point::new(cx, cy)),
+            dim,
+            None,
+            &d,
+        );
+    } else {
+        scene.fill(Fill::NonZero, Affine::IDENTITY, node_c, None, &Circle::new((cx, cy), L::NODE_R));
+    }
+}
+
+// --- content lines ---------------------------------------------------------
+
+fn draw_node_line(scene: &mut Scene, x: f64, cy: f64, n: &CommitNode, t: &Palette, ctx: &RenderCtx) {
+    let mut x = x;
+    if n.is_divergent {
+        x = alert_badge(scene, x, cy, "divergent", t, ctx);
+    }
+    if n.has_conflict {
+        x = alert_badge(scene, x, cy, "conflict", t, ctx);
+    }
+
+    let (desc, color) = if n.description.is_empty() {
+        let label = if n.is_empty { "(empty)" } else { "(no description)" };
+        (label.to_string(), t.overlay0)
+    } else if n.is_immutable {
+        // Immutable description dimmed to overlay0.
+        (n.description.clone(), t.overlay0)
+    } else {
+        (n.description.clone(), t.text)
+    };
+    text::draw_text(scene, &ctx.fonts.ui, font::FS_MD, color, x, baseline(cy, font::FS_MD), &desc);
+}
+
+fn alert_badge(scene: &mut Scene, x: f64, cy: f64, label: &str, t: &Palette, ctx: &RenderCtx) -> f64 {
+    let tw = text::measure(&ctx.fonts.ui_bold, font::FS_XS, label) as f64;
+    let w = tw + 8.0;
+    let r = Rect::new(x, cy - 7.0, x + w, cy + 7.0);
+    fill_round(scene, r, 3.0, t.bg_error);
+    scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, t.red, None, &r.to_rounded_rect(3.0));
+    text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.red, x + 4.0, baseline(cy, font::FS_XS), label);
+    x + w + 6.0
+}
+
+fn draw_bookmark_line(
+    scene: &mut Scene,
+    x: f64,
+    cy: f64,
+    n: &CommitNode,
+    t: &Palette,
+    ctx: &RenderCtx,
+    lane: Color,
+) {
+    let mut x = x;
+    for b in &n.bookmarks {
+        match &b.kind {
+            BookmarkKind::Local => {
+                let base_label = format!("\u{2942} {}", b.name);
+                let mut full = base_label.clone();
+                if b.conflicted {
+                    full.push_str(" ??");
+                }
+                if b.unsynced {
+                    full.push_str(" *");
+                }
+                let tw = text::measure(&ctx.fonts.ui, font::FS_XS, &full) as f64;
+                let w = tw + 10.0;
+                let r = Rect::new(x, cy - 8.0, x + w, cy + 8.0);
+                fill_round(scene, r, 3.0, t.surface0);
+                let (border, txt) = if b.conflicted {
+                    (t.surface1, t.subtext0)
+                } else {
+                    (theme::with_opacity(lane, 0.5), lane)
+                };
+                scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, border, None, &r.to_rounded_rect(3.0));
+                let bl = baseline(cy, font::FS_XS);
+                let mut mx = text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, txt, x + 5.0, bl, &base_label);
+                if b.conflicted {
+                    mx = text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.red, mx + 2.0, bl, "??");
+                }
+                if b.unsynced {
+                    text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.amber, mx + 2.0, bl, "*");
+                }
+                x += w + 4.0;
+            }
+            BookmarkKind::Remote { remote } => {
+                let label = format!("{}/{}", remote, b.name);
+                let tw = text::measure(&ctx.fonts.ui, font::FS_2XS, &label) as f64;
+                let w = tw + 10.0;
+                let r = Rect::new(x, cy - 7.0, x + w, cy + 7.0);
+                scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, t.surface0, None, &r.to_rounded_rect(3.0));
+                text::draw_text(scene, &ctx.fonts.ui, font::FS_2XS, t.overlay0, x + 5.0, baseline(cy, font::FS_2XS), &label);
+                x += w + 4.0;
+            }
+        }
+    }
+}
+
+fn draw_meta_line(scene: &mut Scene, x: f64, cy: f64, n: &CommitNode, t: &Palette, ctx: &RenderCtx) {
+    let mut x = x;
+    // Change id: amber prefix + faint tail (to 12 chars). Divergent appends /N red.
+    let plen = n.change_prefix_len.min(n.change_id.len());
+    let tail_end = n.change_id.len().min(12);
+    let prefix = &n.change_id[..plen.min(tail_end)];
+    let tail = if plen < tail_end { &n.change_id[plen..tail_end] } else { "" };
+    let bl = baseline(cy, font::FS_SM);
+    let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_SM, t.amber, x, bl, prefix);
+    let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_SM, t.text_faint, end, bl, tail);
+    let end = if n.is_divergent {
+        text::draw_text(scene, &ctx.fonts.mono_bold, font::FS_SM, t.red, end, bl, "/1")
+    } else {
+        end
+    };
+    x = end + 8.0;
+
+    // Commit id: faint prefix-highlight + tail (to 12 chars), --fs-xs overlay0.
+    let cplen = n.commit_prefix_len.min(n.commit_id.len());
+    let ctail_end = n.commit_id.len().min(12);
+    let cprefix = &n.commit_id[..cplen.min(ctail_end)];
+    let ctail = if cplen < ctail_end { &n.commit_id[cplen..ctail_end] } else { "" };
+    let cbl = baseline(cy, font::FS_XS);
+    let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_XS, t.overlay0, x, cbl, cprefix);
+    let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_XS, t.text_faint, end, cbl, ctail);
+    x = end + 8.0;
+
+    // Relative timestamp chip.
+    let ts = relative_time(n.timestamp_ms, NOW_MS);
+    text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, t.overlay0, x, baseline(cy, font::FS_XS), &ts);
+}
+
+fn draw_elided(scene: &mut Scene, x: f64, x1: f64, y: f64, t: &Palette, ctx: &RenderCtx) {
+    let cy = y + L::ROW_H * 0.5;
+    let bl = baseline(cy, font::FS_XS);
+    let end = text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, t.text_faint, x, bl, "(elided revisions)");
+    let stroke = Stroke::new(1.0).with_dashes(0.0, [2.0, 2.0]);
+    scene.stroke(&stroke, Affine::IDENTITY, t.surface1, None, &Line::new((end + 8.0, cy), (x1 - 8.0, cy)));
+}
+
+// --- relative time ---------------------------------------------------------
+
+/// Compact relative age like "3h", "2d", "5mo", "6y" from `ts` vs `now` (ms).
+fn relative_time(ts_ms: i64, now_ms: i64) -> String {
+    let secs = (now_ms - ts_ms).max(0) / 1000;
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    let months = days / 30;
+    let years = days / 365;
+    if secs < 60 {
+        format!("{}s", secs.max(1))
+    } else if mins < 60 {
+        format!("{mins}m")
+    } else if hours < 24 {
+        format!("{hours}h")
+    } else if days < 30 {
+        format!("{days}d")
+    } else if years < 1 {
+        format!("{months}mo")
+    } else {
+        format!("{years}y")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_time_buckets() {
+        let now = NOW_MS;
+        assert_eq!(relative_time(now - 30_000, now), "30s");
+        assert_eq!(relative_time(now - 5 * 60_000, now), "5m");
+        assert_eq!(relative_time(now - 3 * 3_600_000, now), "3h");
+        assert_eq!(relative_time(now - 2 * 86_400_000, now), "2d");
+        // 2026-01-15 -> 2026-06-19 is ~5 months.
+        assert_eq!(relative_time(1_768_471_200_000, now), "5mo");
+    }
 }
