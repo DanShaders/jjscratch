@@ -11,21 +11,30 @@
 //! recompute the diff that follows the cursor). It performs no I/O and owns no
 //! state of its own, which keeps it trivially unit-testable.
 //!
-//! Supported keys (matching lightjj):
+//! Supported keys (mirroring lightjj's revision-list keymap exactly):
 //! - `j` / `ArrowDown`  — move selection down one row (clamped at the bottom)
 //! - `k` / `ArrowUp`    — move selection up one row (clamped at the top)
-//! - `g` / `Home`       — jump to the top (first row)
-//! - `G` / `End`        — jump to the bottom (last row)
 //! - `1` / `2` / `3`    — switch the active view (Revisions / Branches / Merge)
+//!
+//! Deliberately ABSENT (lightjj binds none of these on the revision list):
+//! - There is NO list-jump: lightjj's revision-list nav handler (`navKey` in
+//!   App.svelte) binds only `j`/`k`; `Home`/`End` are unbound and `g`/`G` are
+//!   NOT jumps — `g` is the global git-mode prefix (App.svelte handleGlobalKeys
+//!   `case 'g'` → openModal('git')).
+//! - `4`/`5` toggle the Oplog/Evolog bottom *drawers* in lightjj
+//!   (App.svelte handleGlobalKeys cases '4'/'5' → toggleOplog/toggleEvolog).
+//!   jjscratch's [`UiState`]/[`View`] has no field to represent an open drawer
+//!   yet, so they are intentionally omitted here rather than misrepresented as
+//!   view switches. (The toolbar renders their [4]/[5] hints in src/ui.rs.)
 
 use crate::model::Snapshot;
 use crate::ui::{UiState, View};
 
 /// Route a single key press into `state`, navigating over `snapshot.nodes`.
 ///
-/// `key` is a logical key name. Both the single-character form (`"j"`, `"G"`,
-/// `"1"`) and the spelled-out browser `KeyboardEvent.key` form (`"ArrowDown"`,
-/// `"Home"`, `"End"`) are accepted so the same token works when dispatched to a
+/// `key` is a logical key name. Both the single-character form (`"j"`, `"1"`)
+/// and the spelled-out browser `KeyboardEvent.key` form (`"ArrowDown"`,
+/// `"ArrowUp"`) are accepted so the same token works when dispatched to a
 /// browser or applied natively.
 ///
 /// Returns `true` iff `state.selected` changed as a result (i.e. the cursor
@@ -39,30 +48,29 @@ pub fn handle_key(key: &str, state: &mut UiState, snapshot: &Snapshot) -> bool {
     let before = state.selected;
 
     match key {
+        // lightjj App.svelte navKey: `j`/ArrowDown → select(selectedIndex + 1),
+        // guarded by `selectedIndex < revisions.length - 1` (clamped at bottom).
         "j" | "ArrowDown" => {
             if len != 0 {
                 state.selected = (state.selected + 1).min(last);
             }
         }
+        // lightjj App.svelte navKey: `k`/ArrowUp → select(selectedIndex - 1),
+        // guarded by `selectedIndex > 0` (clamped at top).
         "k" | "ArrowUp" => {
             state.selected = state.selected.saturating_sub(1);
         }
-        "g" | "Home" => {
-            state.selected = 0;
-        }
-        "G" | "End" => {
-            if len != 0 {
-                state.selected = last;
-            }
-        }
+        // lightjj App.svelte handleGlobalKeys case '1' → switchToLogView().
         "1" => {
             state.active_view = View::Revisions;
             return false;
         }
+        // lightjj App.svelte handleGlobalKeys case '2' → switchToBranchesView().
         "2" => {
             state.active_view = View::Branches;
             return false;
         }
+        // lightjj App.svelte handleGlobalKeys case '3' → switchToMergeView().
         "3" => {
             state.active_view = View::Merge;
             return false;
@@ -129,38 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn g_and_home_jump_to_top() {
-        let snap = mock::snapshot();
-        let last = snap.nodes.len() - 1;
-
-        let mut st = state_at(last);
-        assert!(handle_key("g", &mut st, &snap));
-        assert_eq!(st.selected, 0);
-        // Already at top -> no change.
-        assert!(!handle_key("g", &mut st, &snap));
-
-        let mut st = state_at(last);
-        assert!(handle_key("Home", &mut st, &snap));
-        assert_eq!(st.selected, 0);
-    }
-
-    #[test]
-    fn cap_g_and_end_jump_to_bottom() {
-        let snap = mock::snapshot();
-        let last = snap.nodes.len() - 1;
-
-        let mut st = state_at(0);
-        assert!(handle_key("G", &mut st, &snap));
-        assert_eq!(st.selected, last);
-        // Already at bottom -> no change.
-        assert!(!handle_key("G", &mut st, &snap));
-
-        let mut st = state_at(0);
-        assert!(handle_key("End", &mut st, &snap));
-        assert_eq!(st.selected, last);
-    }
-
-    #[test]
     fn view_keys_switch_view_without_moving_cursor() {
         let snap = mock::snapshot();
         let mut st = state_at(2);
@@ -174,6 +150,18 @@ mod tests {
 
         assert!(!handle_key("1", &mut st, &snap));
         assert_eq!(st.active_view, View::Revisions);
+    }
+
+    #[test]
+    fn list_jump_keys_are_unbound() {
+        // lightjj's revision list has NO Home/End/g/G jump; they are no-ops here.
+        let snap = mock::snapshot();
+        let mut st = state_at(1);
+        for key in ["Home", "End", "g", "G"] {
+            assert!(!handle_key(key, &mut st, &snap), "{key} must not move cursor");
+            assert_eq!(st.selected, 1, "{key} must not move cursor");
+            assert_eq!(st.active_view, View::Revisions, "{key} must not switch view");
+        }
     }
 
     #[test]
@@ -191,7 +179,6 @@ mod tests {
         snap.nodes.clear();
         let mut st = state_at(0);
         assert!(!handle_key("j", &mut st, &snap));
-        assert!(!handle_key("G", &mut st, &snap));
         assert!(!handle_key("k", &mut st, &snap));
         assert_eq!(st.selected, 0);
     }
