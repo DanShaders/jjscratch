@@ -1,0 +1,29 @@
+# Shared interaction script for the cross-driver harness.
+#
+# Format (one token per line):
+#   shot <name>   capture the current frame as step-NN-<name>.png
+#   key  <k>      send a key to the input router (j/k/G/ArrowDown/..., 1/2/3)
+#   # ...         comment; blank lines ignored
+#
+# Both drivers (jjscratch `drive` + lightjj `drive-lightjj.mjs`) replay THIS file
+# step for step, so the numbered shots line up for pixel-parity scoring.
+#
+# The j/k steps prove the diff panel FOLLOWS the selection IDENTICALLY in both
+# apps (sub-0.6% mismatch, i.e. only sub-pixel/kerning residual).
+#
+# The final `key G` is a deliberate DIVERGENCE probe: jjscratch implements
+# G/End = jump-to-bottom (spec'd, unit-tested in src/input.rs), but lightjj's
+# revision list binds NO list-level G/End — in lightjj `g` opens git-mode, so its
+# cursor does not move on G. The harness therefore reports `step-04-bottom` as a
+# higher-mismatch step. That gap is a real keybinding difference between the apps,
+# NOT a jjscratch bug; see the harness notes / final report.
+
+shot start
+key j
+shot down1
+key j
+shot down2
+key k
+shot up1
+key G
+shot bottom

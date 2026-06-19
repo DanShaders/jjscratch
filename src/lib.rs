@@ -7,6 +7,7 @@
 //! - [`render`] — headless Vello -> PNG pipeline (the dev/screenshot loop).
 
 pub mod graph_layout;
+pub mod input;
 pub mod model;
 pub mod render;
 pub mod text;
