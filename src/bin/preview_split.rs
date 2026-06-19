@@ -51,6 +51,10 @@ fn main() -> Result<()> {
     let out = args.next().unwrap_or_else(|| "split.png".to_string());
     let width: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1280);
     let height: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(800);
+    // Optional 4th arg: device-pixel scale (e.g. 2 to match a @2x reference).
+    // The renderer paints at LOGICAL size; we composite it under an
+    // Affine::scale into a `scale`×-larger output buffer.
+    let scale: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
     let mut hl = Headless::new()?;
     eprintln!(
@@ -74,8 +78,21 @@ fn main() -> Result<()> {
     let rect = Rect::new(0.0, 0.0, width as f64, height as f64);
     split_diff_view::render(&mut scene, rect, &diff, &ctx);
 
-    let img = hl.render(&scene, width, height, theme.base)?;
+    let (out_scene, ow, oh) = if (scale - 1.0).abs() < f64::EPSILON {
+        (scene, width, height)
+    } else {
+        use vello::kurbo::Affine;
+        let mut scaled = Scene::new();
+        scaled.append(&scene, Some(Affine::scale(scale)));
+        (
+            scaled,
+            (width as f64 * scale).round() as u32,
+            (height as f64 * scale).round() as u32,
+        )
+    };
+
+    let img = hl.render(&out_scene, ow, oh, theme.base)?;
     img.save_png(&out)?;
-    eprintln!("wrote {out} ({width}x{height})");
+    eprintln!("wrote {out} ({ow}x{oh}, scale {scale})");
     Ok(())
 }

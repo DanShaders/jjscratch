@@ -31,7 +31,7 @@ use vello::Scene;
 use jjscratch::model::{ChangeStatus, CommitDiff, DiffLine, FileDiff, Hunk, LineKind};
 use jjscratch::text;
 use jjscratch::theme::{font, layout as L, Palette};
-use jjscratch::ui::{baseline_for, border_bottom, fill_rect, RenderCtx};
+use jjscratch::ui::{baseline_for, border_bottom, fill_rect, stroke_round, RenderCtx};
 
 #[allow(dead_code)]
 fn main() {}
@@ -162,23 +162,56 @@ fn file_block(scene: &mut Scene, rect: Rect, mut y: f64, file: &FileDiff, ctx: &
         x, baseline_for(cy, font::FS_MD, &ctx.fonts.ui_bold), name,
     );
 
-    // +N/-N stats.
-    x += 12.0;
-    if file.added > 0 {
-        x = text::draw_text(
-            scene, &ctx.fonts.mono_bold, font::FS_SM, t.green,
-            x, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &format!("+{}", file.added),
-        );
-        x += 6.0;
+    let _ = x; // path has `flex:1` in lightjj — the stats/actions cluster is
+               // laid out from the RIGHT edge, so the path's end x is unused.
+
+    // Right-aligned cluster (lightjj `.diff-file-path{flex:1}` pushes everything
+    // after it to the right): +N/-N stats, a reviewed checkbox, then the
+    // History / Edit / Discard ghost buttons. Edit is hidden on deleted files.
+    let mut rx = hdr.x1 - PAD_X;
+    let deleted = matches!(file.status, ChangeStatus::Deleted);
+    let buttons: &[(&str, bool)] = if deleted {
+        &[("Discard", true), ("History", false)]
+    } else {
+        &[("Discard", true), ("Edit", false), ("History", false)]
+    };
+    for (label, danger) in buttons {
+        rx = file_action_button(scene, rx, cy, label, *danger, ctx) - 8.0;
     }
+    // Reviewed checkbox (empty rounded square).
+    rx -= 16.0;
+    let cb = Rect::new(rx, cy - 8.0, rx + 16.0, cy + 8.0);
+    stroke_round(scene, cb, 3.0, t.surface1, 1.0);
+    rx -= 10.0;
+    // -N (red) then +N (green), right-to-left.
     if file.removed > 0 {
+        let s = format!("-{}", file.removed);
+        let w = text::measure(&ctx.fonts.mono_bold, font::FS_SM, &s) as f64;
+        rx -= w;
         text::draw_text(
             scene, &ctx.fonts.mono_bold, font::FS_SM, t.red,
-            x, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &format!("-{}", file.removed),
+            rx, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &s,
+        );
+        rx -= 6.0;
+    }
+    if file.added > 0 {
+        let s = format!("+{}", file.added);
+        let w = text::measure(&ctx.fonts.mono_bold, font::FS_SM, &s) as f64;
+        rx -= w;
+        text::draw_text(
+            scene, &ctx.fonts.mono_bold, font::FS_SM, t.green,
+            rx, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &s,
         );
     }
 
     y = hdr.y1;
+
+    // `··· full context` expand row (`.expand-btn`): a full-width centered band
+    // with dashed top/bottom borders, shown only when the file has hidden
+    // context (mirrors lightjj's `!isExpanded && hasHiddenContext`).
+    if has_hidden_context(file) {
+        y = full_context_row(scene, rect, y, ctx);
+    }
 
     // The two column rects. The split is at the panel's horizontal midpoint;
     // the left column carries a border-right (--surface0).
@@ -201,6 +234,64 @@ fn file_block(scene: &mut Scene, rect: Rect, mut y: f64, file: &FileDiff, ctx: &
     // Bottom rule under the file.
     fill_rect(scene, Rect::new(rect.x0, y, rect.x1, y + 1.0), t.surface0);
     y + 1.0
+}
+
+/// Mirror of lightjj's `hasHiddenContext`: true when the file's hunks don't
+/// cover its full span (context above the first hunk or gaps between hunks).
+fn has_hidden_context(file: &FileDiff) -> bool {
+    let Some(first) = file.hunks.first() else {
+        return false;
+    };
+    if first.new_start > 1 {
+        return true;
+    }
+    for w in file.hunks.windows(2) {
+        if w[1].new_start > w[0].new_start + w[0].new_len {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `··· full context` expand band (`.expand-btn`): full width, centered
+/// `···` dots + "full context" label, text-faint, with dashed top/bottom rules.
+fn full_context_row(scene: &mut Scene, rect: Rect, y: f64, ctx: &RenderCtx) -> f64 {
+    let t = ctx.theme;
+    // padding 2px top/bottom around an fs-sm line.
+    let h = 2.0 + L::DIFF_LINE_H + 2.0;
+    let r = Rect::new(rect.x0, y, rect.x1, y + h);
+    fill_rect(scene, r, t.base);
+    // Dashed top & bottom borders (--border-hunk-header ~= surface1).
+    dashed_hline(scene, rect.x0, rect.x1, y, t.surface1);
+    dashed_hline(scene, rect.x0, rect.x1, y + h - 1.0, t.surface1);
+
+    let cy = r.center().y;
+    let dots = "\u{22ef}"; // ⋯
+    let label = "full context";
+    let dw = text::measure(&ctx.fonts.ui, font::FS_SM, dots) as f64;
+    let gap = 6.0;
+    let lw = text::measure(&ctx.fonts.ui, font::FS_SM, label) as f64;
+    let total = dw + gap + lw;
+    let start_x = r.center().x - total / 2.0;
+    let baseline = baseline_for(cy, font::FS_SM, &ctx.fonts.ui);
+    let x = text::draw_text(scene, &ctx.fonts.ui, font::FS_SM, t.text_faint, start_x, baseline, dots);
+    text::draw_text(
+        scene, &ctx.fonts.ui, font::FS_SM, t.text_faint,
+        x + gap, baseline, label,
+    );
+    r.y1
+}
+
+/// A 1px dashed horizontal rule (approximates CSS `border: 1px dashed`).
+fn dashed_hline(scene: &mut Scene, x0: f64, x1: f64, y: f64, color: Color) {
+    let dash = 4.0;
+    let gap = 3.0;
+    let mut x = x0;
+    while x < x1 {
+        let xe = (x + dash).min(x1);
+        fill_rect(scene, Rect::new(x, y, xe, y + 1.0), color);
+        x += dash + gap;
+    }
 }
 
 /// Mirror of `toSplitView` (frontend/src/lib/split-view.ts): pair up
@@ -269,13 +360,21 @@ fn split_hunk_header(
     fill_rect(scene, Rect::new(mid - 1.0, y, mid, y + h), t.surface0);
 
     let cy = l.center().y;
-    let range = format!(
-        "-{},{} +{},{}",
+    // lightjj shows the FULL `@@ -a,b +c,d @@` header string on BOTH columns
+    // (`.diff-hunk-header` renders `hunk.header` verbatim, font-size --fs-sm,
+    // color --overlay0, padding-left 12px). See DiffFileView.svelte split branch.
+    let header = format!(
+        "@@ -{},{} +{},{} @@",
         hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len
     );
+    let baseline = baseline_for(cy, font::FS_SM, &ctx.fonts.mono);
     text::draw_text(
-        scene, &ctx.fonts.mono, font::FS_XS, t.text_faint,
-        l.x0 + PAD_X, baseline_for(cy, font::FS_XS, &ctx.fonts.mono), &range,
+        scene, &ctx.fonts.mono, font::FS_SM, t.overlay0,
+        l.x0 + PAD_X, baseline, &header,
+    );
+    text::draw_text(
+        scene, &ctx.fonts.mono, font::FS_SM, t.overlay0,
+        r.x0 + PAD_X, baseline, &header,
     );
     l.y1
 }
@@ -314,12 +413,20 @@ enum Side {
     New,
 }
 
-/// `.diff-empty` filler color: a faint wash distinct from `base`. The spec names
-/// `--bg-diff-empty`; the palette doesn't expose it, so we derive a subtle fill
-/// from `mantle` (the same neutral the chrome bands use), kept clearly dimmer
-/// than add/remove tints.
+/// `.diff-empty` filler color. lightjj's `--bg-diff-empty` is
+/// `color-mix(in srgb, var(--text) 2%, transparent)` — i.e. `text` at 2% alpha
+/// laid over the panel `base`. We composite it once here so the filler reads as
+/// the same near-base wash lightjj paints.
 fn empty_bg(t: &Palette) -> Color {
-    t.mantle.multiply_alpha(0.6)
+    mix(t.base, t.text, 0.02)
+}
+
+/// Composite `over` at `alpha` on top of opaque `under` (srgb-ish lerp).
+fn mix(under: Color, over: Color, alpha: f32) -> Color {
+    let u = under.to_rgba8();
+    let o = over.to_rgba8();
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * alpha) as u8;
+    Color::from_rgb8(lerp(u.r, o.r), lerp(u.g, o.g), lerp(u.b, o.b))
 }
 
 fn paint_side(scene: &mut Scene, cell: Rect, line: Option<&DiffLine>, side: Side, ctx: &RenderCtx) {
@@ -391,6 +498,37 @@ fn badge_for(status: ChangeStatus, t: &Palette) -> (&'static str, Color, Color) 
         ChangeStatus::Renamed => ("R", t.amber, t.amber.multiply_alpha(0.12)),
         ChangeStatus::Copied => ("C", t.red, t.red.multiply_alpha(0.12)),
     }
+}
+
+/// A `.btn.btn-sm` ghost pill in the file header, laid out right-to-left from
+/// `right_x`. Returns the pill's LEFT x. `danger` ⇒ `.btn-danger` (red outline,
+/// red text); otherwise the neutral ghost (surface1 border, subtext0 text).
+fn file_action_button(
+    scene: &mut Scene,
+    right_x: f64,
+    cy: f64,
+    label: &str,
+    danger: bool,
+    ctx: &RenderCtx,
+) -> f64 {
+    let t = ctx.theme;
+    // .btn-sm: padding 2px 8px, fs-xs.
+    let pad_x = 8.0;
+    let tw = text::measure(&ctx.fonts.ui, font::FS_XS, label) as f64;
+    let bw = tw + pad_x * 2.0;
+    let bh = 18.0;
+    let r = Rect::new(right_x - bw, cy - bh / 2.0, right_x, cy + bh / 2.0);
+    let (border, fg) = if danger {
+        (t.red, t.red)
+    } else {
+        (t.surface1, t.subtext0)
+    };
+    stroke_round(scene, r, 4.0, border, 1.0);
+    text::draw_text(
+        scene, &ctx.fonts.ui, font::FS_XS, fg,
+        r.x0 + pad_x, baseline_for(cy, font::FS_XS, &ctx.fonts.ui), label,
+    );
+    r.x0
 }
 
 /// Split into (dir-with-trailing-slash, name).
