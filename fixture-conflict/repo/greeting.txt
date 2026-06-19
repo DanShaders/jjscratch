@@ -1,0 +1,10 @@
+line one
+<<<<<<< conflict 1 of 1
+%%%%%%% diff from: tpnnoktx 916b5f51 "base: add greeting"
+\\\\\\\        to: zvntrlvk 15da65f9 "feature-a: rewrite line two"
+-line two
++FEATURE A change
++++++++ lopwknrv f544fb83 "feature-b: rewrite line two"
+FEATURE B change
+>>>>>>> conflict 1 of 1 ends
+line three
