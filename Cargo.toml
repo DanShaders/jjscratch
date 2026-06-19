@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "jjscratch — a native, GPU-rendered Jujutsu client (Vello + wgpu). UI copy of lightjj."
 
+[features]
+# The real jj-lib backend is heavy to compile; keep it opt-in so renderer work
+# iterates against the mock. `cargo build --features jjlib` enables it.
+default = []
+jjlib = ["dep:jj-lib", "dep:futures"]
+
 [dependencies]
 vello = "0.9"
 # skrifa pinned to the same version vello 0.9 uses, for glyph metrics / charmap
@@ -12,6 +18,10 @@ skrifa = "0.42"
 pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
+
+# Backend (opt-in via `jjlib` feature). Pinned to match the fixture's jj 0.42.
+jj-lib = { version = "0.42", optional = true }
+futures = { version = "0.3", optional = true }
 
 [[bin]]
 name = "shot"
