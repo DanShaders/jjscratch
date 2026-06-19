@@ -2,7 +2,7 @@
 # scripts/sizecheck.sh — High-DPI + window-size robustness harness.
 #
 # Renders a matrix of (logical width x height x scale x state) via src/bin/shot.rs
-# against the real fixture repo, then runs tools/sizecheck/check.py over each PNG
+# against the real fixture repo, then runs scripts/sizecheck_check.py over each PNG
 # to flag layout breakage. Prints a PASS/WARN/FAIL table and writes the same
 # results into docs/qa/. Rerunnable: it regenerates everything from scratch.
 #
@@ -23,6 +23,15 @@ export JJSCRATCH_REPO="$ROOT/fixture/repo"
 echo "Building shot (jjlib)…"
 cargo build --features jjlib --bin shot 2>&1 | tail -1
 SHOT="$ROOT/target/debug/shot"
+
+# The pixel checker. Lives in scripts/ (tools/ is .gitignored).
+CHECKER="$ROOT/scripts/sizecheck_check.py"
+
+# Per-render wall-clock cap (seconds). The software (lavapipe) rasteriser falls
+# off a hard cliff above ~16M DEVICE pixels (e.g. 3440x1440@2 = 6880x2880 =
+# 19.8M px): renders that normally take <1s never complete. Cap so one bad cell
+# cannot stall the whole matrix; such cells are reported as a timeout FAIL.
+SHOT_TIMEOUT="${SHOT_TIMEOUT:-90}"
 
 # Matrix rows: "name W H SCALE KEYS THEME".
 #   KEYS  = value for JJSCRATCH_KEYS ("-" = none)
@@ -65,21 +74,25 @@ for row in "${MATRIX[@]}"; do
   NAME="$1"; W="$2"; H="$3"; SCALE="$4"; KEYS="$5"; THEME="$6"
   PNG="$OUT/${NAME}.png"
 
+  rm -f "$PNG"
   if [ "$KEYS" = "-" ]; then
-    JJSCRATCH_KEYS="" "$SHOT" "$PNG" "$W" "$H" "$SCALE" >/dev/null 2>&1
+    timeout "$SHOT_TIMEOUT" env JJSCRATCH_KEYS="" "$SHOT" "$PNG" "$W" "$H" "$SCALE" >/dev/null 2>&1
   else
-    JJSCRATCH_KEYS="$KEYS" "$SHOT" "$PNG" "$W" "$H" "$SCALE" >/dev/null 2>&1
+    timeout "$SHOT_TIMEOUT" env JJSCRATCH_KEYS="$KEYS" "$SHOT" "$PNG" "$W" "$H" "$SCALE" >/dev/null 2>&1
   fi
   RC=$?
 
   STATE="${KEYS}"
   [ "$KEYS" = "-" ] && STATE="def"
 
-  if [ $RC -ne 0 ] || [ ! -s "$PNG" ]; then
+  if [ $RC -eq 124 ]; then
+    RESULT="FAIL"; NOTES="render TIMED OUT after ${SHOT_TIMEOUT}s (device ${W}x${H}@${SCALE} too large for lavapipe?)"
+    FAIL=$((FAIL+1))
+  elif [ $RC -ne 0 ] || [ ! -s "$PNG" ]; then
     RESULT="FAIL"; NOTES="shot exited $RC / no PNG (PANIC?)"
     FAIL=$((FAIL+1))
   else
-    JSON="$(uv run --quiet "$ROOT/tools/sizecheck/check.py" "$PNG" --scale "$SCALE" --theme "$THEME" --json 2>/dev/null)"
+    JSON="$(uv run --quiet "$CHECKER" "$PNG" --scale "$SCALE" --theme "$THEME" --json 2>/dev/null)"
     RESULT="$(printf '%s' "$JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])' 2>/dev/null)"
     NOTES="$(printf '%s' "$JSON" | python3 -c 'import sys,json;print(" | ".join(json.load(sys.stdin)["messages"]))' 2>/dev/null)"
     case "$RESULT" in
