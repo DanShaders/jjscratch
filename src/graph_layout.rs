@@ -343,4 +343,85 @@ mod tests {
 
         assert!(g.width_cols >= 2, "fork widened the gutter");
     }
+
+    /// The structural invariants the `graphstress` differential harness asserts
+    /// on every random repo, distilled to a unit regression: for any laid-out
+    /// DAG, (a) rows map 1:1 to nodes in order, (b) each node's own cell is a
+    /// pipe/elided marker (never Empty/elbow), (c) node columns stay within
+    /// `width_cols`, and (d) no two nodes collide at a (row, node-col).
+    fn assert_layout_consistent(nodes: &[CommitNode], g: &GraphLayout) {
+        assert_eq!(g.rows.len(), nodes.len(), "one row per node");
+        let mut seen = std::collections::HashSet::new();
+        for (i, row) in g.rows.iter().enumerate() {
+            assert_eq!(row.node_index, i, "row {i} indexes node {i}");
+            let col = row.node_col();
+            assert!(col < g.width_cols, "row {i} node_col {col} within width");
+            assert!(seen.insert((i, col)), "no (row,col) collision at row {i}");
+            assert!(
+                matches!(row.cells.get(col), Some(Cell::Vertical) | Some(Cell::Elided)),
+                "row {i} node cell at col {col} must be a pipe/elided, got {:?}",
+                row.cells.get(col),
+            );
+        }
+        // Direct edges may only reference nodes present in the list.
+        let present: std::collections::HashSet<&str> =
+            nodes.iter().map(|n| n.commit_id.as_str()).collect();
+        for node in nodes {
+            for p in &node.parents {
+                if p.edge_type == EdgeType::Direct {
+                    assert!(
+                        present.contains(p.commit_id.as_str()),
+                        "Direct edge {}->{} references an absent node",
+                        node.commit_id,
+                        p.commit_id,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_with_elided_parent_is_consistent() {
+        // A merge whose second parent is filtered out (Indirect edge to an
+        // absent commit) plus a converging side branch — exercises forks,
+        // merges, elision, and a dangling-but-Indirect edge all at once.
+        let nodes = vec![
+            n("merge", &[("a", EdgeType::Direct), ("gone", EdgeType::Indirect)]),
+            n("a", &[("base", EdgeType::Direct)]),
+            n("side", &[("base", EdgeType::Direct)]),
+            n("base", &[("root", EdgeType::Indirect)]),
+            n("root", &[]),
+        ];
+        let g = layout(&nodes);
+        assert_layout_consistent(&nodes, &g);
+        // The merge node forks a lane for its second (Indirect) parent.
+        assert!(
+            g.rows[0]
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::ElbowTopLeft | Cell::ElbowTopRight)),
+            "merge row should fork a lane for the second parent, got {:?}",
+            g.rows[0].cells,
+        );
+        // base's Indirect first-parent edge marks its lane elided.
+        assert_eq!(g.rows[3].cells[g.rows[3].node_col()], Cell::Elided);
+    }
+
+    #[test]
+    fn linear_and_fork_shapes_stay_consistent() {
+        // Re-validate the canonical shapes through the same invariant checker.
+        let linear = vec![
+            n("c", &[("b", EdgeType::Direct)]),
+            n("b", &[("a", EdgeType::Direct)]),
+            n("a", &[]),
+        ];
+        assert_layout_consistent(&linear, &layout(&linear));
+
+        let fork = vec![
+            n("p", &[("p1", EdgeType::Direct), ("p2", EdgeType::Direct)]),
+            n("p1", &[]),
+            n("p2", &[]),
+        ];
+        assert_layout_consistent(&fork, &layout(&fork));
+    }
 }
