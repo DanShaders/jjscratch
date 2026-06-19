@@ -13,5 +13,6 @@ pub mod render;
 pub mod text;
 pub mod theme;
 pub mod ui;
+pub mod watch;
 
 pub use render::{Headless, Image};
