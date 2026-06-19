@@ -316,12 +316,14 @@ fn group_row(scene: &mut Scene, rect: Rect, y: f64, label: &str, count: usize, c
     let cy = r.center().y;
     let sz = font::FS_SM;
 
-    // Chevron (expanded ▼).
+    // Chevron (expanded ▼). `.bp-chevron` inherits body `--font-ui` (the ▼
+    // glyph resolves via the symbol fallback either way, but keep the family
+    // naming consistent with lightjj).
     let chev = "\u{25bc}";
     let cx = r.x0 + PAD_X;
     let cend = text::draw_text(
-        scene, &ctx.fonts.mono, font::FS_3XS, t.subtext0,
-        cx, baseline_for(cy, font::FS_3XS, &ctx.fonts.mono), chev,
+        scene, &ctx.fonts.ui, font::FS_3XS, t.subtext0,
+        cx, baseline_for(cy, font::FS_3XS, &ctx.fonts.ui), chev,
     );
     // Label (uppercase, weight 600).
     let lend = text::draw_text(
