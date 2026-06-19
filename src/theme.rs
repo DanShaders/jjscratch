@@ -128,6 +128,68 @@ pub const DARK: Palette = Palette {
     backdrop: rgba(0, 0, 0, 128),
 };
 
+/// Default LIGHT palette ("Default Light", docs/spec/ui-spec.md §1).
+///
+/// Mirrors DARK field-for-field. Primaries come from lightjj's
+/// `:root[data-theme="light"]` block (theme.css) / themes.ts "Default Light".
+/// Derived row/selection/hunk backgrounds use the same `color-mix(... p%,
+/// transparent/text)` formulas as DARK, re-resolved over the LIGHT base
+/// (#f8f8f6) so they read as opaque tints. Diff word/add/remove stay true-alpha
+/// (same alpha bytes as DARK) since they overlay arbitrary code.
+pub const LIGHT: Palette = Palette {
+    base: rgb(0xf8, 0xf8, 0xf6),
+    mantle: rgb(0xf8, 0xf8, 0xf6),
+    crust: rgb(0xee, 0xee, 0xec),
+    surface0: rgb(0xef, 0xef, 0xed), // text 4% over base
+    surface1: rgb(0xe8, 0xe8, 0xe7), // text 7% over base
+    surface2: rgb(0xa1, 0xa1, 0xaa), // strong borders/dividers ONLY (never text)
+    text: rgb(0x1a, 0x1a, 0x1e),
+    subtext0: rgb(0x71, 0x71, 0x7a),
+    subtext1: rgb(0x1a, 0x1a, 0x1e),
+    overlay0: rgb(0x71, 0x71, 0x7a),
+    overlay1: rgb(0x62, 0x62, 0x6a),
+    text_faint: rgb(0x94, 0x94, 0x95), // text 45% over base (the only correct dim-text color)
+    amber: rgb(0xe6, 0x8a, 0x00),
+    green: rgb(0x2e, 0x7d, 0x32),
+    red: rgb(0xc6, 0x28, 0x28),
+    blue: rgb(0x48, 0x60, 0xa0),
+    mauve: rgb(0x88, 0x39, 0xef),
+    lavender: rgb(0x72, 0x87, 0xfd),
+    graph: [
+        rgb(0x9A, 0x6E, 0x18),
+        rgb(0x98, 0x48, 0x30),
+        rgb(0x88, 0x38, 0x58),
+        rgb(0x6A, 0x48, 0x90),
+        rgb(0x48, 0x60, 0xA0),
+        rgb(0x38, 0x78, 0x80),
+        rgb(0x3A, 0x80, 0x38),
+        rgb(0x88, 0x78, 0x20),
+    ],
+    syn_keyword: rgb(0x88, 0x39, 0xef),
+    syn_string: rgb(0x40, 0xa0, 0x2b),
+    syn_number: rgb(0xfe, 0x64, 0x0b),
+    syn_comment: rgb(0x9c, 0xa0, 0xb0),
+    syn_type: rgb(0xdf, 0x8e, 0x1d),
+    syn_property: rgb(0x1e, 0x66, 0xf5),
+    syn_operator: rgb(0x6c, 0x6f, 0x85),
+    syn_punct: rgb(0x9c, 0xa0, 0xb0),
+    syn_atom: rgb(0xfe, 0x64, 0x0b),
+    bg_hover: rgb(0xef, 0xef, 0xed), // = surface0
+    bg_selected: rgb(0xf7, 0xef, 0xe2), // amber 8% over base
+    bg_checked: rgb(0xe8, 0xee, 0xe6), // green 8% over base
+    bg_checked_selected: rgb(0xe0, 0xe9, 0xde), // green 12% over base
+    bg_active: rgb(0xf5, 0xe9, 0xd4), // active seg-btn (amber 14% over base)
+    bg_error: rgb(0xf3, 0xe3, 0xe1), // red 10% over base
+    bg_warning: rgb(0xf6, 0xed, 0xdd), // amber 10% over base
+    diff_add_bg: rgba(0x2e, 0x7d, 0x32, 26),    // green @ ~10%
+    diff_remove_bg: rgba(0xc6, 0x28, 0x28, 26), // red @ ~10%
+    diff_add_word: rgba(0x2e, 0x7d, 0x32, 56),  // green @ ~22%
+    diff_remove_word: rgba(0xc6, 0x28, 0x28, 56),
+    bg_hunk_header: rgb(0xf1, 0xf1, 0xf0), // text 3% over base
+    btn_primary_hover: rgb(0xc7, 0x79, 0x05), // amber 85% + text 15%
+    backdrop: rgba(0, 0, 0, 77),               // rgba(0,0,0,0.3) (light)
+};
+
 /// Graph node glyph opacity (renderer multiplies lane color alpha by this).
 pub const GRAPH_NODE_OPACITY: f32 = 0.8;
 /// Graph connector-line opacity.
