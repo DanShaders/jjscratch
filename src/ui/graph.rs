@@ -80,13 +80,24 @@ pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiStat
         }
     }
 
-    let mut y = rect.y0 + LIST_TOP_PAD - state.graph_scroll;
-    for (node_idx, line) in &flat {
+    // Viewport windowing: every flattened row is a fixed L::ROW_H tall, so the
+    // first on-screen row index is exact arithmetic. We jump straight to it
+    // instead of iterating-and-skipping every off-screen row above the viewport,
+    // and we still stop at the first row past the bottom. The visible rows are
+    // drawn byte-identically — only the leading off-screen draw work (glyphs,
+    // text measurement, gutter cells) is elided. This makes the draw loop
+    // O(visible rows), not O(history).
+    let top0 = rect.y0 + LIST_TOP_PAD - state.graph_scroll;
+    let first_visible = if top0 >= rect.y0 {
+        0
+    } else {
+        // Smallest index whose row bottom (top0 + (idx+1)*ROW_H) reaches rect.y0.
+        (((rect.y0 - top0) / L::ROW_H).floor() as usize).min(flat.len())
+    };
+
+    let mut y = top0 + first_visible as f64 * L::ROW_H;
+    for (node_idx, line) in flat.iter().skip(first_visible) {
         let row = Rect::new(rect.x0, y, rect.x1, y + L::ROW_H);
-        if row.y1 < rect.y0 {
-            y += L::ROW_H;
-            continue;
-        }
         if row.y0 > rect.y1 {
             break;
         }

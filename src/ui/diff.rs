@@ -61,16 +61,62 @@ pub fn render(
     y = files_bar(scene, rect, y, diff, ctx);
     y = diff_toolbar(scene, rect, y, ctx);
 
-    // Scrolling content region.
+    // Scrolling content region — windowed to the viewport. Each file block has
+    // an exact, computable pixel height (fixed 18px lines + fixed-height
+    // headers/elisions), so a file entirely above the viewport is *skipped*
+    // without drawing any of its header / hunk-headers / lines — we only advance
+    // y. A file intersecting the viewport is drawn in full (its own per-line
+    // skip/break handles within-file windowing); we stop once past the bottom.
+    // Nothing visible changes: off-screen blocks were never painted, only
+    // walked. This makes the loop O(visible files), not O(all files).
     y -= state.diff_scroll;
     for file in &diff.files {
         if y > rect.y1 {
             break;
         }
+        let h = file_block_height(file);
+        if y + h < rect.y0 {
+            // Entirely above the viewport: skip building it.
+            y += h;
+            continue;
+        }
         y = file_block(scene, rect, y, file, ctx);
     }
 
     scene.pop_layer();
+}
+
+/// Exact pixel height a [`file_block`] consumes, computed without drawing. Kept
+/// in lockstep with `file_block`'s layout so skipping an off-screen block
+/// advances `y` to the byte-identical position the full walk would reach.
+fn file_block_height(file: &FileDiff) -> f64 {
+    // File header (§5.4).
+    let mut h = 7.0 + font::FS_MD as f64 + 8.0 + 7.0;
+
+    for (hi, hunk) in file.hunks.iter().enumerate() {
+        // Leading elision before the first bounded hunk of a Modified file.
+        if hi == 0 && file.status == ChangeStatus::Modified {
+            let first = hunk
+                .lines
+                .iter()
+                .find_map(|l| l.new_no.or(l.old_no))
+                .unwrap_or(1);
+            if first.saturating_sub(1) > 0 {
+                h += L::DIFF_LINE_H + 4.0; // elision row
+            }
+        }
+        // Hunk header.
+        h += 3.0 + font::FS_SM as f64 + 6.0 + 3.0;
+        // Hunk lines (fixed 18px each).
+        h += hunk.lines.len() as f64 * L::DIFF_LINE_H;
+    }
+
+    // Trailing "rest of file" affordance.
+    if matches!(file.status, ChangeStatus::Modified | ChangeStatus::Deleted) {
+        h += L::DIFF_LINE_H + 4.0;
+    }
+
+    h
 }
 
 // --- §5.1 Revision header --------------------------------------------------

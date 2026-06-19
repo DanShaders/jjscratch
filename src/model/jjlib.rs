@@ -660,6 +660,12 @@ pub fn commit_diff(loaded: &Loaded, commit_id: &str) -> anyhow::Result<CommitDif
 
     let files = pollster::block_on(async {
         let mut files = Vec::new();
+        // Running budget of materialized diff lines across all files in this
+        // commit. Once exhausted, remaining files are emitted collapsed (a
+        // "large diff" placeholder) so a pathological commit (thousands of files
+        // / a few enormous ones) never costs seconds — mirroring lightjj's
+        // auto-collapse of huge diffs.
+        let mut line_budget: usize = MAX_TOTAL_DIFF_LINES;
         let mut stream = from_tree.diff_stream(&to_tree, &EverythingMatcher);
         while let Some(entry) = stream.next().await {
             let path = entry.path;
@@ -678,7 +684,13 @@ pub fn commit_diff(loaded: &Loaded, commit_id: &str) -> anyhow::Result<CommitDif
             };
 
             let path_str = path.as_internal_file_string().to_owned();
-            files.push(build_file_diff(path_str, status, before, after));
+            files.push(build_file_diff(
+                path_str,
+                status,
+                before,
+                after,
+                &mut line_budget,
+            ));
         }
         Ok::<_, anyhow::Error>(files)
     })?;
@@ -730,7 +742,23 @@ fn split_lines(s: &str) -> Vec<String> {
     lines
 }
 
-fn build_file_diff(path: String, status: ChangeStatus, before: Side, after: Side) -> FileDiff {
+/// Per-file line cap: if either side of a file exceeds this, skip the expensive
+/// line-diff and emit a single collapsed "large diff" placeholder hunk (a
+/// whole-file summary) instead. Mirrors lightjj's >500-line auto-collapse.
+const MAX_FILE_LINES: usize = 500;
+
+/// Commit-wide materialized-diff-line budget. Once a commit's expanded hunks
+/// reach this many lines, remaining files are collapsed. Mirrors lightjj's
+/// >2000-total-line auto-collapse. (Each large file also charges its size here.)
+const MAX_TOTAL_DIFF_LINES: usize = 2000;
+
+fn build_file_diff(
+    path: String,
+    status: ChangeStatus,
+    before: Side,
+    after: Side,
+    line_budget: &mut usize,
+) -> FileDiff {
     let (old_lines, new_lines) = match (before, after) {
         (Side::Text(o), Side::Text(n)) => (o, n),
         (Side::Absent, Side::Text(n)) => (Vec::new(), n),
@@ -747,6 +775,27 @@ fn build_file_diff(path: String, status: ChangeStatus, before: Side, after: Side
         }
     };
 
+    // Cap pathological inputs. A file is "large" if either side exceeds the
+    // per-file cap, or the commit-wide line budget is already exhausted. For
+    // those we never run the line-diff: we emit a collapsed placeholder hunk
+    // ("large diff (N lines) — not expanded") so we never spend seconds on a
+    // 20k-line file or thousands of files. The +/- stats are reported as a
+    // whole-file replace (all old removed, all new added), the cheap, correct
+    // upper bound jj/lightjj also show for a collapsed file.
+    let total = old_lines.len().max(new_lines.len());
+    if total > MAX_FILE_LINES || *line_budget == 0 {
+        // Charge the (estimated) size against the commit budget so a flood of
+        // large files keeps collapsing rather than each re-checking from full.
+        *line_budget = line_budget.saturating_sub(total);
+        return FileDiff {
+            path,
+            status,
+            added: new_lines.len() as u32,
+            removed: old_lines.len() as u32,
+            hunks: vec![large_diff_placeholder(old_lines.len(), new_lines.len())],
+        };
+    }
+
     let ops = diff_lines(&old_lines, &new_lines);
     let hunks = group_hunks(&ops, &old_lines, &new_lines, 3);
 
@@ -760,6 +809,10 @@ fn build_file_diff(path: String, status: ChangeStatus, before: Side, after: Side
         }
     }
 
+    // Charge the materialized hunk lines against the commit-wide budget.
+    let materialized: usize = hunks.iter().map(|h| h.lines.len()).sum();
+    *line_budget = line_budget.saturating_sub(materialized);
+
     FileDiff {
         path,
         status,
@@ -769,7 +822,37 @@ fn build_file_diff(path: String, status: ChangeStatus, before: Side, after: Side
     }
 }
 
-// --- A small LCS line diff (no extra deps) --------------------------------
+/// A single collapsed placeholder hunk for a file too large to expand. Carries
+/// one context line describing the size; the renderer shows it as a normal
+/// (single-line) hunk, so no UI change is needed.
+fn large_diff_placeholder(old_len: usize, new_len: usize) -> Hunk {
+    let total = old_len + new_len;
+    Hunk {
+        old_start: if old_len > 0 { 1 } else { 0 },
+        old_len: old_len as u32,
+        new_start: if new_len > 0 { 1 } else { 0 },
+        new_len: new_len as u32,
+        header_context: String::new(),
+        lines: vec![DiffLine {
+            kind: LineKind::Context,
+            old_no: None,
+            new_no: None,
+            text: format!("large diff ({total} lines) — not expanded"),
+        }],
+    }
+}
+
+// --- Linear-space Myers line diff (O(ND) time, O(N+M) space) --------------
+//
+// Replaces the old classic O(n·m)-time / O(n·m)-space LCS DP. That table was
+// ~4×10⁸ cells (~1.6 GB) for a 20k-line file — the entire huge-diff cost. This
+// is the divide-and-conquer ("linear space refinement") variant of Myers' O(ND)
+// diff (Myers 1986, §4b): each level finds the *middle snake* of the optimal
+// edit path using two D-band frontiers in O(N+M) space, then recurses on the
+// two halves. Total time is O((N+M)·D) where D is the edit distance, and peak
+// memory is linear. The emitted edit script is identical in shape to before
+// (a stream of Context / Remove / Add in order), so all downstream hunk
+// grouping and rendering is byte-for-byte unchanged for normal diffs.
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -781,47 +864,175 @@ enum Op {
     Add(usize),
 }
 
-/// Classic LCS dynamic-programming line diff. Returns an edit script in order.
+/// Linear-space Myers line diff. Returns an ordered edit script.
+///
+/// Both frontier vectors are indexed on the **forward diagonal axis** k = x − y,
+/// k ∈ [−N, +M]. `idx(k) = off + k` keeps that within bounds. The forward search
+/// reads/writes `v[idx(k)]`; the backward search works on the same k-axis but
+/// from the bottom-right corner. They overlap on a single absolute diagonal,
+/// which is the correct correspondence (this is the indexing the classic
+/// linear-space refinement uses, and the part that is easy to get wrong).
 fn diff_lines(old: &[String], new: &[String]) -> Vec<Op> {
-    let n = old.len();
-    let m = new.len();
-
-    // lcs[i][j] = length of LCS of old[i..] and new[j..].
-    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i][j] = if old[i] == new[j] {
-                lcs[i + 1][j + 1] + 1
-            } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
-            };
-        }
-    }
-
-    let mut ops = Vec::with_capacity(n + m);
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < n && j < m {
-        if old[i] == new[j] {
-            ops.push(Op::Context(i, j));
-            i += 1;
-            j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            ops.push(Op::Remove(i));
-            i += 1;
-        } else {
-            ops.push(Op::Add(j));
-            j += 1;
-        }
-    }
-    while i < n {
-        ops.push(Op::Remove(i));
-        i += 1;
-    }
-    while j < m {
-        ops.push(Op::Add(j));
-        j += 1;
-    }
+    let mut ops = Vec::with_capacity(old.len().max(new.len()) + 1);
+    // The backward search works on diagonals around `delta`, so the index axis
+    // must cover k ∈ [delta - dmax, delta + dmax]; with |delta| ≤ N+M and
+    // dmax ≤ (N+M)/2+1 the extreme |k| is up to ~1.5·(N+M). Allocate with a
+    // generous centered offset so neither frontier ever indexes out of bounds.
+    let off = (2 * (old.len() + new.len()) + 4) as isize;
+    let len = (2 * off + 1) as usize;
+    let mut vf = vec![0isize; len];
+    let mut vb = vec![0isize; len];
+    myers_rec(old, new, 0, 0, off, &mut vf, &mut vb, &mut ops);
     ops
+}
+
+/// Recursively diff `old` vs `new`, emitting ops with absolute indices offset by
+/// `o0`/`n0`. Strategy (Myers' linear-space refinement): find the *middle snake*
+/// — a common run on a shortest edit path — then recurse on the region before it
+/// and after it, emitting the snake's lines as context in between.
+fn myers_rec(
+    old: &[String],
+    new: &[String],
+    o0: usize,
+    n0: usize,
+    off: isize,
+    vf: &mut [isize],
+    vb: &mut [isize],
+    ops: &mut Vec<Op>,
+) {
+    // Trim the common prefix/suffix first. This both speeds the search and — by
+    // ensuring the middle region's endpoints differ — guarantees the middle
+    // snake cannot span the whole middle, so every recursion strictly shrinks
+    // the problem (no infinite recursion).
+    let mut pre = 0;
+    while pre < old.len() && pre < new.len() && old[pre] == new[pre] {
+        ops.push(Op::Context(o0 + pre, n0 + pre));
+        pre += 1;
+    }
+    let mut eo = old.len();
+    let mut en = new.len();
+    // (suffix context is emitted *after* the middle, below)
+    while eo > pre && en > pre && old[eo - 1] == new[en - 1] {
+        eo -= 1;
+        en -= 1;
+    }
+
+    let mid_old = &old[pre..eo];
+    let mid_new = &new[pre..en];
+    let mo = o0 + pre;
+    let mn = n0 + pre;
+    let n = mid_old.len();
+    let m = mid_new.len();
+
+    if n == 0 {
+        for j in 0..m {
+            ops.push(Op::Add(mn + j));
+        }
+    } else if m == 0 {
+        for i in 0..n {
+            ops.push(Op::Remove(mo + i));
+        }
+    } else {
+        // After trimming, mid_old[0] != mid_new[0] and the last lines differ, so
+        // the middle snake is a proper interior split.
+        let (x, y, u, v) = middle_snake(mid_old, mid_new, off, vf, vb);
+        myers_rec(&mid_old[..x], &mid_new[..y], mo, mn, off, vf, vb, ops);
+        for k in 0..(u - x) {
+            ops.push(Op::Context(mo + x + k, mn + y + k));
+        }
+        myers_rec(&mid_old[u..], &mid_new[v..], mo + u, mn + v, off, vf, vb, ops);
+    }
+
+    // Emit the trimmed common suffix, in order, after the middle.
+    for k in 0..(old.len() - eo) {
+        ops.push(Op::Context(o0 + eo + k, n0 + en + k));
+    }
+}
+
+/// Myers' middle-snake search (linear space). Returns `(x, y, u, v)`: the middle
+/// snake of a shortest edit path runs from `(x, y)` to `(u, v)` (relative to the
+/// given non-empty slices) with `old[x..u] == new[y..v]`. `vf`/`vb` are reusable
+/// frontiers indexed on the forward k-axis via `off`.
+fn middle_snake(
+    old: &[String],
+    new: &[String],
+    off: isize,
+    vf: &mut [isize],
+    vb: &mut [isize],
+) -> (usize, usize, usize, usize) {
+    let n = old.len() as isize;
+    let m = new.len() as isize;
+    let delta = n - m;
+    let odd = (delta & 1) != 0;
+    let idx = |k: isize| (off + k) as usize;
+
+    // Forward starts at (0,0) on diagonal 0; backward starts at (n,m) on
+    // diagonal delta. We seed the "previous" cells so d=0 reads correctly: the
+    // forward k=0 cell derives x=0, and the backward k=delta cell derives x=n
+    // (its `k+1` branch computes vb[idx(delta+1)] - 1, so seed = n + 1).
+    vf[idx(1)] = 0;
+    vb[idx(delta + 1)] = n + 1;
+
+    let dmax = (n + m + 2) / 2;
+    for d in 0..=dmax {
+        // --- Forward pass over k = -d, -d+2, …, d ---
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && vf[idx(k - 1)] < vf[idx(k + 1)]) {
+                vf[idx(k + 1)] // came from k+1 by an insert (down)
+            } else {
+                vf[idx(k - 1)] + 1 // came from k-1 by a delete (right)
+            };
+            let mut y = x - k;
+            let (sx, sy) = (x, y);
+            while x < n && y < m && old[x as usize] == new[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            vf[idx(k)] = x;
+            // Overlap (odd delta): forward on diagonal k meets backward, which
+            // covers diagonals in [delta-d, delta+d].
+            if odd && k >= delta - (d - 1) && k <= delta + (d - 1) {
+                if vf[idx(k)] >= vb[idx(k)] {
+                    return (sx as usize, sy as usize, x as usize, y as usize);
+                }
+            }
+            k += 2;
+        }
+
+        // --- Backward pass over k = delta-d, …, delta+d (step 2) ---
+        // vb[idx(k)] holds the *smallest* x reached on diagonal k from the
+        // bottom-right corner. At the band edges we must come from the only
+        // available neighbor: the upper edge (k == delta-d) from k+1, the lower
+        // edge (k == delta+d) from k-1.
+        let mut k = delta - d;
+        while k <= delta + d {
+            let mut x = if k == delta - d
+                || (k != delta + d && vb[idx(k + 1)] - 1 < vb[idx(k - 1)])
+            {
+                vb[idx(k + 1)] - 1 // came from k+1 by a delete (left)
+            } else {
+                vb[idx(k - 1)] // came from k-1 by an insert (up)
+            };
+            let mut y = x - k;
+            let (ex, ey) = (x, y); // snake end (lower-right), exclusive bound
+            while x > 0 && y > 0 && old[(x - 1) as usize] == new[(y - 1) as usize] {
+                x -= 1;
+                y -= 1;
+            }
+            vb[idx(k)] = x;
+            // Overlap (even delta): backward on diagonal k meets forward.
+            if !odd && k >= -d && k <= d {
+                if vf[idx(k)] >= vb[idx(k)] {
+                    return (x as usize, y as usize, ex as usize, ey as usize);
+                }
+            }
+            k += 2;
+        }
+    }
+
+    // Non-empty inputs always overlap before this is reached.
+    (0, 0, n as usize, m as usize)
 }
 
 /// Group an edit script into unified-diff hunks with `context` lines of
@@ -1092,5 +1303,225 @@ mod tests {
             .expect("src/parser.rs in diff");
         assert_eq!(parser_rs.status, ChangeStatus::Deleted);
         assert!(parser_rs.removed > 0);
+    }
+
+    // --- Linear-space Myers diff correctness -------------------------------
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(|s| s.to_owned()).collect()
+    }
+
+    /// Reconstruct what the edit script claims `old`/`new` are, to validate that
+    /// an `Op` stream is a *correct* (not necessarily minimal) diff: replaying
+    /// Context+Remove must reproduce `old`, and Context+Add must reproduce `new`,
+    /// with strictly increasing indices.
+    fn replay(ops: &[Op], old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut o = Vec::new();
+        let mut n = Vec::new();
+        let (mut pi, mut pj): (isize, isize) = (-1, -1);
+        for op in ops {
+            match *op {
+                Op::Context(i, j) => {
+                    assert!(i as isize > pi && j as isize > pj, "indices must increase");
+                    pi = i as isize;
+                    pj = j as isize;
+                    o.push(old[i].clone());
+                    n.push(new[j].clone());
+                }
+                Op::Remove(i) => {
+                    assert!(i as isize > pi, "old indices must increase");
+                    pi = i as isize;
+                    o.push(old[i].clone());
+                }
+                Op::Add(j) => {
+                    assert!(j as isize > pj, "new indices must increase");
+                    pj = j as isize;
+                    n.push(new[j].clone());
+                }
+            }
+        }
+        (o, n)
+    }
+
+    #[test]
+    fn myers_matches_expected_known_case() {
+        // A known case: insert + delete + change in the middle of shared context.
+        let old = lines("a\nb\nc\nd\ne\nf");
+        let new = lines("a\nb\nX\nd\ne\nf\ng");
+        let ops = diff_lines(&old, &new);
+
+        // Replaying must reproduce both sides exactly.
+        let (ro, rn) = replay(&ops, &old, &new);
+        assert_eq!(ro, old, "Remove+Context must reconstruct old");
+        assert_eq!(rn, new, "Add+Context must reconstruct new");
+
+        // And the edit must be the *minimal* one: c→X is one remove + one add,
+        // g is a trailing add; a,b,d,e,f stay context. So 6 context, 1 remove,
+        // 2 add.
+        let mut ctx = 0;
+        let mut rem = 0;
+        let mut add = 0;
+        for op in &ops {
+            match op {
+                Op::Context(..) => ctx += 1,
+                Op::Remove(_) => rem += 1,
+                Op::Add(_) => add += 1,
+            }
+        }
+        assert_eq!((ctx, rem, add), (5, 1, 2), "minimal edit: 5 ctx, 1 rem, 2 add");
+    }
+
+    #[test]
+    fn myers_handles_edge_cases() {
+        // Empty old (pure add).
+        let new = lines("x\ny\nz");
+        let ops = diff_lines(&[], &new);
+        assert!(ops.iter().all(|o| matches!(o, Op::Add(_))));
+        let (_, rn) = replay(&ops, &[], &new);
+        assert_eq!(rn, new);
+
+        // Empty new (pure remove).
+        let old = lines("x\ny\nz");
+        let ops = diff_lines(&old, &[]);
+        assert!(ops.iter().all(|o| matches!(o, Op::Remove(_))));
+
+        // Identical (all context).
+        let same = lines("p\nq\nr");
+        let ops = diff_lines(&same, &same);
+        assert!(ops.iter().all(|o| matches!(o, Op::Context(..))));
+        assert_eq!(ops.len(), same.len());
+
+        // Both empty.
+        assert!(diff_lines(&[], &[]).is_empty());
+    }
+
+    /// Brute-force reference LCS length, to cross-check that Myers is *minimal*.
+    fn lcs_len(old: &[String], new: &[String]) -> usize {
+        let n = old.len();
+        let m = new.len();
+        let mut dp = vec![vec![0usize; m + 1]; n + 1];
+        for i in 0..n {
+            for j in 0..m {
+                dp[i + 1][j + 1] = if old[i] == new[j] {
+                    dp[i][j] + 1
+                } else {
+                    dp[i + 1][j].max(dp[i][j + 1])
+                };
+            }
+        }
+        dp[n][m]
+    }
+
+    #[test]
+    fn myers_minimal_and_correct_on_random_inputs() {
+        // Deterministic LCG so this is reproducible without an rng dep.
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let n = (next() % 30) as usize;
+            let m = (next() % 30) as usize;
+            // Small alphabet so collisions (real LCS structure) are common.
+            let mk = |len: usize, r: &mut dyn FnMut() -> u64| -> Vec<String> {
+                (0..len).map(|_| format!("L{}", r() % 6)).collect()
+            };
+            let old = mk(n, &mut next);
+            let new = mk(m, &mut next);
+
+            let ops = diff_lines(&old, &new);
+            // Correctness: replay reproduces both sides.
+            let (ro, rn) = replay(&ops, &old, &new);
+            assert_eq!(ro, old, "old mismatch for {old:?} -> {new:?}");
+            assert_eq!(rn, new, "new mismatch for {old:?} -> {new:?}");
+
+            // Minimality: number of context ops equals the LCS length.
+            let ctx = ops.iter().filter(|o| matches!(o, Op::Context(..))).count();
+            assert_eq!(
+                ctx,
+                lcs_len(&old, &new),
+                "non-minimal diff for {old:?} -> {new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_file_is_capped_to_placeholder() {
+        // A file far over the per-file cap must NOT be line-diffed: it collapses
+        // to a single placeholder hunk, with whole-file +/- stats.
+        let old: Vec<String> = (0..MAX_FILE_LINES + 10).map(|i| format!("old {i}")).collect();
+        let new: Vec<String> = (0..MAX_FILE_LINES + 20).map(|i| format!("new {i}")).collect();
+        let mut budget = MAX_TOTAL_DIFF_LINES;
+        let fd = build_file_diff(
+            "big.rs".to_string(),
+            ChangeStatus::Modified,
+            Side::Text(old.clone()),
+            Side::Text(new.clone()),
+            &mut budget,
+        );
+        assert_eq!(fd.hunks.len(), 1, "capped file is one collapsed hunk");
+        assert_eq!(fd.hunks[0].lines.len(), 1, "placeholder is a single line");
+        assert!(
+            fd.hunks[0].lines[0].text.contains("not expanded"),
+            "placeholder text present: {:?}",
+            fd.hunks[0].lines[0].text
+        );
+        assert_eq!(fd.added, new.len() as u32);
+        assert_eq!(fd.removed, old.len() as u32);
+
+        // A normal-sized file is still fully expanded (not collapsed).
+        let mut budget = MAX_TOTAL_DIFF_LINES;
+        let small_old = lines("a\nb\nc");
+        let small_new = lines("a\nB\nc");
+        let fd = build_file_diff(
+            "small.rs".to_string(),
+            ChangeStatus::Modified,
+            Side::Text(small_old),
+            Side::Text(small_new),
+            &mut budget,
+        );
+        let has_change = fd
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .any(|l| !matches!(l.kind, LineKind::Context));
+        assert!(has_change, "small file is line-diffed, not collapsed");
+        assert!(
+            !fd.hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .any(|l| l.text.contains("not expanded")),
+            "small file must not carry the placeholder"
+        );
+    }
+
+    #[test]
+    fn total_line_budget_collapses_later_files() {
+        // Exhaust the commit-wide budget, then a subsequent normal file collapses.
+        let mut budget = 5usize; // tiny budget
+        let big: Vec<String> = (0..100).map(|i| format!("x {i}")).collect();
+        let _ = build_file_diff(
+            "a.rs".to_string(),
+            ChangeStatus::Added,
+            Side::Absent,
+            Side::Text(big),
+            &mut budget,
+        );
+        // After a 100-line add (over the budget of 5), budget is exhausted.
+        assert_eq!(budget, 0);
+        let fd = build_file_diff(
+            "b.rs".to_string(),
+            ChangeStatus::Modified,
+            Side::Text(lines("p\nq")),
+            Side::Text(lines("p\nQ")),
+            &mut budget,
+        );
+        assert!(
+            fd.hunks.iter().any(|h| h.lines.iter().any(|l| l.text.contains("not expanded"))),
+            "file after budget exhaustion collapses"
+        );
     }
 }
