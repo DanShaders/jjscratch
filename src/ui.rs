@@ -111,13 +111,16 @@ pub struct FrameLayout {
     pub graph_header: Rect,
     pub graph_content: Rect,
     pub divider: Rect,
-    pub diff_header: Rect,
+    /// Diff panel chrome header ("CHANGES"/"DIFF"). `None` in the Revisions view:
+    /// lightjj shows the RevisionHeader (drawn inside `diff.rs`) as the very top
+    /// of the diff panel, with no chrome title bar above it.
+    pub diff_header: Option<Rect>,
     pub diff_content: Rect,
     pub statusbar: Rect,
 }
 
 impl FrameLayout {
-    pub fn compute(w: f64, h: f64, panel_w: f64) -> Self {
+    pub fn compute(w: f64, h: f64, panel_w: f64, view: View) -> Self {
         let panel_w = panel_w.clamp(L::REVISION_PANEL_MIN_W, L::REVISION_PANEL_MAX_W);
         let mut y = 0.0;
         let toolbar = Rect::new(0.0, y, w, y + L::TOOLBAR_H);
@@ -135,8 +138,17 @@ impl FrameLayout {
 
         let divider = Rect::new(panel_w, body_top, panel_w + L::PANEL_DIVIDER_W, body_bot);
         let diff_x = divider.x1;
-        let diff_header = Rect::new(diff_x, body_top, w, body_top + L::PANEL_HEADER_H);
-        let diff_content = Rect::new(diff_x, diff_header.y1, w, body_bot);
+        // The Revisions view has NO "CHANGES" chrome title bar: lightjj's
+        // RevisionHeader (drawn by diff.rs) is the very top of the panel. Other
+        // views keep a panel header. When there's no header, the diff content
+        // spans the full body height starting at `body_top`.
+        let (diff_header, diff_content) = if view == View::Revisions {
+            (None, Rect::new(diff_x, body_top, w, body_bot))
+        } else {
+            let header = Rect::new(diff_x, body_top, w, body_top + L::PANEL_HEADER_H);
+            let content = Rect::new(diff_x, header.y1, w, body_bot);
+            (Some(header), content)
+        };
 
         let statusbar = Rect::new(0.0, body_bot, w, h);
 
@@ -166,7 +178,7 @@ pub fn build_scene(
     height: f64,
 ) {
     let t = ctx.theme;
-    let fl = FrameLayout::compute(width, height, state.panel_width);
+    let fl = FrameLayout::compute(width, height, state.panel_width, state.active_view);
 
     // Base background (everything paints on top).
     fill_rect(scene, Rect::new(0.0, 0.0, width, height), t.base);
@@ -190,9 +202,11 @@ pub fn build_scene(
     // Divider.
     fill_rect(scene, fl.divider, t.surface1);
 
-    // Diff panel chrome + content.
-    let diff_title = if state.active_view == View::Revisions { "CHANGES" } else { "DIFF" };
-    draw_panel_header(scene, fl.diff_header, diff_title, None, false, ctx);
+    // Diff panel chrome + content. In the Revisions view there is no "CHANGES"
+    // title bar — the RevisionHeader (drawn inside diff::render) is the panel top.
+    if let Some(diff_header) = fl.diff_header {
+        draw_panel_header(scene, diff_header, "DIFF", None, false, ctx);
+    }
     diff::render(scene, fl.diff_content, snapshot, diff, state, ctx);
 
     draw_statusbar(scene, &fl, ctx, snapshot);
@@ -215,14 +229,9 @@ fn draw_toolbar(
     let cy = bar.center().y;
     let mut x = TOOLBAR_PAD_X;
 
-    // 1. Logo: 16×16 svg. Stand-in: a small amber "jj" mark drawn as a dot.
-    scene.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        t.amber,
-        None,
-        &vello::kurbo::Circle::new((x + 8.0, cy), 5.0),
-    );
+    // 1. Logo: 16×16 svg. lightjj's mark is a thin amber lightning bolt; we
+    // approximate it as a filled zig-zag glyph centered in the 16px logo box.
+    draw_logo_bolt(scene, x + 8.0, cy, t.amber);
     x += 16.0 + TOOLBAR_GAP;
 
     // 2. divider.
@@ -314,21 +323,37 @@ fn draw_revset_bar(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx) {
         scene, &ctx.fonts.mono, sz, t.text_faint,
         r.x0 + REVSET_PAD_X, baseline_for(cy, sz, &ctx.fonts.mono), "$",
     );
+    // Trailing `?` help button (circular, --text-faint, 1px --surface1 border),
+    // right-anchored at the bar's padding edge.
+    let help_d = r.height() - REVSET_PAD_Y * 2.0;
+    let help = Rect::new(r.x1 - REVSET_PAD_X - help_d, cy - help_d / 2.0, r.x1 - REVSET_PAD_X, cy + help_d / 2.0);
+    stroke_round(scene, help, help_d / 2.0, t.surface1, 1.0);
+    let q = "?";
+    let qw = text::measure(&ctx.fonts.ui, sz, q) as f64;
+    text::draw_text(
+        scene, &ctx.fonts.ui, sz, t.text_faint,
+        help.center().x - qw / 2.0, baseline_for(cy, sz, &ctx.fonts.ui), q,
+    );
+
     // Input box: flex:1, bg --base, 1px --surface1, radius 3, padding 3px 6px.
+    // Ends short of the `?` button (8px gap).
     let input = Rect::new(
         icon_end + 6.0,
         r.y0 + REVSET_PAD_Y,
-        r.x1 - REVSET_PAD_X,
+        help.x0 - 8.0,
         r.y1 - REVSET_PAD_Y,
     );
     fill_round(scene, input, 3.0, t.base);
     stroke_round(scene, input, 3.0, t.surface1, 1.0);
-    // Placeholder (the default revset), color --surface1 per spec.
+    // Placeholder (the default revset), color --surface1 per spec. Clipped to the
+    // input box so our wider mono can't bleed the text over the `?` button.
+    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &input);
     text::draw_text(
         scene, &ctx.fonts.mono, sz, t.surface2,
         input.x0 + 6.0 + REVSET_INPUT_PAD_Y, baseline_for(input.center().y, sz, &ctx.fonts.mono),
         "present(@) | ancestors(immutable_heads().., 2) | trunk()",
     );
+    scene.pop_layer();
 }
 
 /// Preset-chips row (`.preset-chips`): a wrapping row of small chips
@@ -428,6 +453,31 @@ fn draw_statusbar(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx, snapshot
 }
 
 // --- toolbar pieces -------------------------------------------------------
+
+/// lightjj's logo mark: a thin amber lightning bolt. Drawn as a filled zig-zag
+/// polygon centered on `(cx, cy)`, sized to sit inside the 16px logo box.
+fn draw_logo_bolt(scene: &mut Scene, cx: f64, cy: f64, color: Color) {
+    use vello::kurbo::BezPath;
+    // Bolt spans ~6px wide × ~14px tall; a slim "Z" stroke with two kicks.
+    let (hw, hh) = (3.2, 7.0); // half-width, half-height of the bolt box
+    let l = cx - hw;
+    let r = cx + hw;
+    let top = cy - hh;
+    let bot = cy + hh;
+    let mid = cy;
+    let w = 2.0; // bolt thickness
+    let mut p = BezPath::new();
+    // Down-stroke from top-right to the left-of-center midpoint, then the
+    // notch back out, then continuing down to the bottom-left tip.
+    p.move_to((r, top));
+    p.line_to((l + w, mid - 1.0));
+    p.line_to((cx, mid - 1.0));
+    p.line_to((l, bot));
+    p.line_to((r - w, mid + 1.0));
+    p.line_to((cx, mid + 1.0));
+    p.close_path();
+    scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &p);
+}
 
 /// `.toolbar-divider`: 1px wide × 14px tall, bg --surface1. Returns its right x.
 fn toolbar_divider(scene: &mut Scene, x: f64, bar: Rect, t: &Palette) -> f64 {

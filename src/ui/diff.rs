@@ -32,15 +32,6 @@ const NEW_NUM_RIGHT: f64 = 58.0; // right edge of the new line-number column
 const GUTTER_BORDER_X: f64 = 67.0; // context-line gutter right border
 const CODE_X: f64 = 83.5; // left edge of code text (prefix sits 1ch to its left)
 
-// Vertical compensation: ui.rs unconditionally paints a 34px "CHANGES" panel
-// header above this panel's content rect, but lightjj's Revisions view shows the
-// RevisionHeader *instead of* a panel header (no "CHANGES" bar). We can't touch
-// ui.rs, so we recover the resulting downward offset by trimming each chrome
-// header here, landing the diff lines (the bulk of the panel) on the reference.
-// Applied only to the three once-per-panel chrome headers (RevisionHeader, FILES
-// bar, toolbar) — not the per-file header — so every file's lines stay aligned.
-const HEADER_TRIM: f64 = 8.0;
-
 pub fn render(
     scene: &mut Scene,
     rect: Rect,
@@ -93,8 +84,9 @@ fn revision_header(
     ctx: &RenderCtx,
 ) -> f64 {
     let t = ctx.theme;
-    // padding 8x12 (vertical compressed by HEADER_TRIM, see its doc).
-    let h = 8.0 + font::FS_MD as f64 + 8.0 + 4.0 - HEADER_TRIM;
+    // RevisionHeader (§5.1): 41px tall, calibrated to docs/reference/revisions.png
+    // (the "lklqykmz (no description)" band that is the very top of the panel).
+    let h = 41.0;
     let r = Rect::new(rect.x0, y, rect.x1, y + h);
     fill_rect(scene, r, t.mantle);
     border_bottom(scene, r, t.surface0);
@@ -141,8 +133,8 @@ fn revision_header(
 
 fn files_bar(scene: &mut Scene, rect: Rect, y: f64, diff: &CommitDiff, ctx: &RenderCtx) -> f64 {
     let t = ctx.theme;
-    // padding 6x12.
-    let h = 6.0 + font::FS_MD as f64 + 8.0 + 6.0 - HEADER_TRIM;
+    // FILES bar (§5.2): 38px tall, calibrated to docs/reference/revisions.png.
+    let h = 38.0;
     let r = Rect::new(rect.x0, y, rect.x1, y + h);
     fill_rect(scene, r, t.mantle);
     border_bottom(scene, r, t.surface0);
@@ -225,7 +217,8 @@ fn files_bar(scene: &mut Scene, rect: Rect, y: f64, diff: &CommitDiff, ctx: &Ren
 
 fn diff_toolbar(scene: &mut Scene, rect: Rect, y: f64, ctx: &RenderCtx) -> f64 {
     let t = ctx.theme;
-    let h = 4.0 + font::FS_SM as f64 + 8.0 + 4.0 - HEADER_TRIM;
+    // Diff toolbar (§5.3): 30px tall, calibrated to docs/reference/revisions.png.
+    let h = 30.0;
     let r = Rect::new(rect.x0, y, rect.x1, y + h);
     fill_rect(scene, r, t.mantle);
     border_bottom(scene, r, t.surface0);
