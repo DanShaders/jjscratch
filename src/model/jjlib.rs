@@ -91,14 +91,12 @@ pub fn open(path: &Path) -> anyhow::Result<Loaded> {
     })
 }
 
-/// Build the immutable-heads ancestors revset, mirroring the fixture's
-/// `immutable_heads() = present(main) | tags()` alias.
+/// The commit ids of the fixture's `immutable_heads()` alias,
+/// `immutable_heads() = present(main) | tags()`.
 ///
-/// jj-lib has no built-in `immutable()`; we reconstruct `::(<heads> | root())`
-/// from primitives. To avoid the revset symbol parser we read the head commit
-/// ids straight from the view (the `main` local bookmark + all tags) and build
-/// `commits(heads).ancestors() | root()`.
-fn immutable_expr(repo: &ReadonlyRepo) -> Arc<ResolvedRevsetExpression> {
+/// To avoid the revset symbol parser we read the head commit ids straight from
+/// the view: the `main` local bookmark plus every tag's local + remote targets.
+fn immutable_head_ids(repo: &ReadonlyRepo) -> Vec<CommitId> {
     let view = repo.view();
     let mut heads: Vec<CommitId> = Vec::new();
 
@@ -115,6 +113,16 @@ fn immutable_expr(repo: &ReadonlyRepo) -> Arc<ResolvedRevsetExpression> {
             heads.extend(remote_ref.target.added_ids().cloned());
         }
     }
+    heads
+}
+
+/// Build the immutable-heads ancestors revset, mirroring the fixture's
+/// `immutable_heads() = present(main) | tags()` alias.
+///
+/// jj-lib has no built-in `immutable()`; we reconstruct `::(<heads> | root())`
+/// from primitives: `commits(heads).ancestors() | root()`.
+fn immutable_expr(repo: &ReadonlyRepo) -> Arc<ResolvedRevsetExpression> {
+    let heads = immutable_head_ids(repo);
 
     let root: Arc<ResolvedRevsetExpression> = RevsetExpression::root();
     if heads.is_empty() {
@@ -122,6 +130,64 @@ fn immutable_expr(repo: &ReadonlyRepo) -> Arc<ResolvedRevsetExpression> {
     }
     let heads_expr: Arc<ResolvedRevsetExpression> = RevsetExpression::commits(heads);
     heads_expr.ancestors().union(&root)
+}
+
+/// Build jj's default-log revset for this fixture:
+///
+/// ```text
+/// present(@) | ancestors(immutable_heads().., 2) | present(trunk())
+/// ```
+///
+/// where, for this fixture, `immutable_heads() = present(main) | tags()` and
+/// `trunk()` resolves to `root()` (its default `latest(remote_bookmarks(main@origin)
+/// | … | root())` falls back to `root()` because the fixture has no remote
+/// bookmarks). The fixture overrides only `immutable_heads()`, not `trunk()`.
+///
+/// Translation to jj-lib combinators (all on the *resolved* expression state):
+///
+/// * `present(@)` → `commits([wc_id])` (omitted entirely if there is no working
+///   copy, which is exactly what `present()` does for an absent name).
+/// * `immutable_heads()..` → `immutable_heads().range(visible_heads())`. jj's
+///   `x..` desugars to `~ancestors(x)`, which after resolution against the
+///   visible DAG equals `ancestors(visible_heads()) ∖ ancestors(immutable_heads())`
+///   — exactly what `range(roots = immutable_heads, heads = visible_heads)`
+///   computes ("commits reachable from heads but not from roots").
+/// * `ancestors(<range>, 2)` → `<range>.ancestors_range(0..2)`. This is the
+///   generation-limited ancestors API; depth 2 keeps generations 0 and 1, so
+///   deeper immutable ancestors drop out. That gap is what makes `stream_graph`
+///   emit `Indirect` (elided) edges → the `(elided revisions)` marker.
+/// * `trunk()` → `root()`.
+///
+/// All pieces are unioned. The result is the same row set, count, and elision
+/// that `jj log` (and lightjj) show by default: `@`, wip, refactor, the
+/// `experiment` fork, feat[main], then the elided gap, then the root commit.
+fn default_log_expr(
+    repo: &ReadonlyRepo,
+    wc_commit_id: Option<&CommitId>,
+) -> Arc<ResolvedRevsetExpression> {
+    let mut parts: Vec<Arc<ResolvedRevsetExpression>> = Vec::new();
+
+    // present(@)
+    if let Some(wc_id) = wc_commit_id {
+        parts.push(RevsetExpression::commits(vec![wc_id.clone()]));
+    }
+
+    // ancestors(immutable_heads().., 2)
+    let immutable_heads: Arc<ResolvedRevsetExpression> = {
+        let heads = immutable_head_ids(repo);
+        if heads.is_empty() {
+            RevsetExpression::root()
+        } else {
+            RevsetExpression::commits(heads)
+        }
+    };
+    let after_immutable = immutable_heads.range(&RevsetExpression::visible_heads());
+    parts.push(after_immutable.ancestors_range(0..2));
+
+    // trunk() — resolves to root() for this fixture (no remote bookmarks).
+    parts.push(RevsetExpression::root());
+
+    RevsetExpression::union_all(&parts)
 }
 
 /// Evaluate a revset and eagerly test membership of `ids`, returning a map for
@@ -143,8 +209,18 @@ fn collect_membership(
     Ok(out)
 }
 
-/// Build a full [`Snapshot`] by streaming `all()` and turning each graph node
-/// into a [`CommitNode`], ordered to match `jj log`'s default output.
+/// Build a full [`Snapshot`] by streaming jj's default-log revset and turning
+/// each graph node into a [`CommitNode`], ordered to match `jj log`'s default
+/// output.
+///
+/// # Revset
+///
+/// We evaluate [`default_log_expr`] (jj's built-in default-log revset,
+/// `present(@) | ancestors(immutable_heads().., 2) | present(trunk())`) rather
+/// than `all()`. That narrower set shows the same rows lightjj does and, because
+/// the immutable ancestors are limited to 2 generations, `stream_graph` emits
+/// `Indirect` (elided) edges across the dropped commits — which the graph
+/// renderer draws as the `(elided revisions)` marker.
 ///
 /// # Ordering
 ///
@@ -161,7 +237,7 @@ fn collect_membership(
 /// branch containing `@` (the working copy and its ancestors) is emitted before
 /// any other head. That reproduces lightjj's default-log order exactly:
 /// `@`, wip, refactor, then the `experiment` fork interleaved at its branch
-/// point, then feat[main], docs, init, root.
+/// point, then feat[main], then the elided gap and the root commit.
 ///
 /// Re-grouping only changes the node *sequence*; each node keeps its original
 /// parent edges from `stream_graph`, so the DAG/lane layout is unchanged.
@@ -170,11 +246,13 @@ pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
     let store = repo.store();
     let view = repo.view();
 
-    // 1. Stream the DAG: (CommitId, edges) in jj-log order.
-    let all: Arc<ResolvedRevsetExpression> = RevsetExpression::all();
-    let revset = all
+    // 1. Stream the DAG: (CommitId, edges) in jj-log order. We use jj's
+    //    default-log revset (not all()), so the rows, count, and elision match
+    //    lightjj.
+    let expr = default_log_expr(repo, loaded.wc_commit_id.as_ref());
+    let revset = expr
         .evaluate(repo)
-        .map_err(|e| anyhow!("evaluating all(): {e}"))?;
+        .map_err(|e| anyhow!("evaluating default-log revset: {e}"))?;
 
     let graph_nodes: Vec<(CommitId, Vec<(CommitId, EdgeType)>)> = pollster::block_on(async {
         // Re-group the topological stream into contiguous branches (jj's CLI
@@ -264,7 +342,8 @@ pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
             is_immutable,
             is_divergent,
             has_conflict: commit.has_conflict(),
-            // `all()` only yields visible commits; hidden commits are not shown.
+            // The default-log revset only yields visible commits; hidden
+            // commits are not shown.
             is_hidden: false,
             parents,
             bookmarks,
@@ -638,11 +717,27 @@ mod tests {
         let loaded = open(&fixture_path()).expect("open fixture");
         let snap = snapshot(&loaded).expect("snapshot");
 
-        // 8 revisions in jj-log order: @, wip, refactor, experiment (fork),
-        // feat[main], docs, init, root.
-        assert_eq!(snap.nodes.len(), 8, "expected 8 revisions");
+        // jj's default-log revset (present(@) | ancestors(immutable_heads().., 2)
+        // | trunk()) yields 6 rows in jj-log order: @, wip, refactor, experiment
+        // (fork), feat[main], root. The intermediate immutable ancestors (docs,
+        // init) are elided — the 2-generation ancestors limit drops them, which
+        // shows up as an Indirect (elided) edge toward the root.
+        assert_eq!(snap.nodes.len(), 6, "expected 6 revisions");
         assert_eq!(snap.workspace_name, "default");
         assert_eq!(snap.repo_name, "repo");
+
+        // Elision: at least one Indirect edge exists (the dropped immutable
+        // ancestors between feat and root), which the graph renderer draws as
+        // the "(elided revisions)" marker.
+        let has_indirect = snap
+            .nodes
+            .iter()
+            .flat_map(|n| &n.parents)
+            .any(|p| p.edge_type == EdgeType::Indirect);
+        assert!(
+            has_indirect,
+            "expected an Indirect (elided) edge for the dropped ancestors"
+        );
 
         // Ordering: the working copy must be first (jj prioritizes the
         // working-copy branch), and the side branch `experiment` must come
