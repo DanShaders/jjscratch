@@ -224,6 +224,47 @@ pub fn measure(font: &FontData, size: f32, text: &str) -> f32 {
     resolve(&shapers, text).iter().map(|(_, _, adv)| *adv).sum()
 }
 
+/// Baseline `y` that vertically centers a single icon `glyph`'s real ink box on
+/// `cy`, using the metrics of whichever font in `[font, ...fallbacks()]` actually
+/// renders it.
+///
+/// Toolbar icons (`◉ ⑂ ⧉ ⟲ ◐ ◇ …`) almost always resolve in a *fallback* font
+/// (Noto Sans Math / Symbols 2) whose vertical metrics differ wildly from the
+/// requested UI/mono font's. Centering them with the requested font's line box
+/// (`baseline_for` in ui.rs) leaves them visibly high or low. Here we look up the
+/// glyph's exact bounding box (`y_min..y_max` at `size`) in the font that draws
+/// it and place the baseline so that box straddles `cy` — pixel-true centering
+/// that's independent of which font won the fallback race.
+///
+/// Falls back to the resolving (or requested) font's line-box centering if the
+/// glyph has no outline bounds (a `.notdef` box, or a whitespace glyph).
+pub fn icon_baseline(font: &FontData, size: f32, glyph: char, cy: f64) -> f64 {
+    let fb = fallbacks();
+    let Some((fonts, shapers)) = shapers_for(font, fb, size) else {
+        return cy;
+    };
+    // Find the font that actually renders this glyph.
+    let resolved = shapers
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| s.glyph(glyph).map(|gid| (i, gid)));
+    if let Some((i, gid)) = resolved {
+        if let Some(bb) = shapers[i].metrics.bounds(gid) {
+            // skrifa y is up-positive: ink spans [y_min, y_max] above the
+            // baseline. In scene coords (y down) the box occupies
+            // [baseline - y_max, baseline - y_min]; centering its midpoint on
+            // `cy` gives baseline = cy + (y_max + y_min) / 2.
+            return cy + ((bb.y_max + bb.y_min) / 2.0) as f64;
+        }
+        // No outline bounds: center on the resolving font's line box.
+        let m = line_metrics(fonts[i], size);
+        return cy + (m.ascent - m.descent.abs()) as f64 / 2.0;
+    }
+    // Nothing covers it: requested font's line box.
+    let m = line_metrics(font, size);
+    cy + (m.ascent - m.descent.abs()) as f64 / 2.0
+}
+
 /// Draw `text` into `scene` with its baseline at (`x`, `baseline_y`) in scene
 /// coordinates. Returns the advanced x position (x + run width) for chaining.
 ///
