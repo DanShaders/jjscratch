@@ -13,7 +13,7 @@ use vello::kurbo::{Affine, BezPath, Cap, Circle, Line, Point, Rect, Stroke};
 use vello::peniko::{Color, Fill};
 use vello::Scene;
 
-use super::{baseline, fill_rect, fill_round, RenderCtx, UiState};
+use super::{baseline_for, fill_rect, fill_round, RenderCtx, UiState};
 use crate::graph_layout::{self, Cell, LayoutRow};
 use crate::model::{BookmarkKind, CommitNode, EdgeType, Snapshot};
 use crate::text;
@@ -21,6 +21,21 @@ use crate::theme::{self, font, layout as L, Palette};
 
 /// Fixed "now" for relative-time rendering: 2026-06-19 ≈ 1781913600000 ms.
 const NOW_MS: i64 = 1_781_913_600_000;
+
+/// Horizontal gap (px) between the gutter SVG and the row content column. lightjj's
+/// `.graph-row` reserves the SVG box (gutterWidth columns) then a flex gap before the
+/// node/meta/bookmark content; matched empirically to the reference's content x0.
+const CONTENT_GAP: f64 = 20.0;
+
+/// Inline-flex gap (px) between badges/segments on a content line (`gap:6` node line,
+/// `gap:4` bookmark line, `gap:8` meta line — §4.2/§4.3/§4.4).
+const NODE_LINE_GAP: f64 = 6.0;
+const BOOKMARK_GAP: f64 = 4.0;
+const META_GAP: f64 = 8.0;
+
+/// Top padding (px) of the graph row list below the panel header — matches the
+/// reference's first-row offset from the "REVISIONS" header.
+const LIST_TOP_PAD: f64 = 2.0;
 
 /// One flattened display row tied to a revision.
 enum LineKind {
@@ -43,7 +58,7 @@ pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiStat
     let gutter_cols = g.width_cols.clamp(1, L::MAX_GUTTER_COLS as usize);
     let gutter_w = gutter_cols as f64 * L::CELL_W;
     // lightjj leaves a comfortable gap between the gutter SVG and the row content.
-    let content_x = gutter_x0 + gutter_w + 12.0;
+    let content_x = gutter_x0 + gutter_w + CONTENT_GAP;
 
     // Flatten: per revision, a node line, optional bookmark line, meta line; an
     // elided marker row follows a revision whose first parent edge is Indirect.
@@ -65,7 +80,7 @@ pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiStat
         }
     }
 
-    let mut y = rect.y0 - state.graph_scroll;
+    let mut y = rect.y0 + LIST_TOP_PAD - state.graph_scroll;
     for (node_idx, line) in &flat {
         let row = Rect::new(rect.x0, y, rect.x1, y + L::ROW_H);
         if row.y1 < rect.y0 {
@@ -89,8 +104,16 @@ pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiStat
             fill_rect(scene, row, t.bg_hover);
         }
 
-        // Gutter pipes for this sub-row (continuous across the revision's lines).
-        draw_cells(scene, gutter_x0, y, &lrow.cells, &t.graph);
+        // Gutter pipes for this sub-row. lightjj draws each revision's connector
+        // SVG once across all its sub-rows, with elbows/horizontals only where the
+        // node sits; the bookmark/meta/elided continuation rows below it just carry
+        // the through-lane verticals. We mirror that: the node sub-row gets the full
+        // connector cells, continuation rows get only the lanes that keep going down.
+        if matches!(line, LineKind::Node) {
+            draw_cells(scene, gutter_x0, y, &lrow.cells, &t.graph);
+        } else {
+            draw_cells(scene, gutter_x0, y, &continuation_cells(&lrow.cells), &t.graph);
+        }
 
         // Node glyph on the node line only.
         if matches!(line, LineKind::Node) {
@@ -127,6 +150,25 @@ fn node_center_x(gx0: f64, lrow: &LayoutRow) -> f64 {
 }
 
 // --- gutter ----------------------------------------------------------------
+
+/// Connector cells for a revision's *continuation* sub-rows (bookmark/meta/elided),
+/// below the node row. Only the lanes that exit the bottom of the node row keep
+/// going: through verticals stay vertical, a fork's top-elbow becomes its newly
+/// opened vertical, an elided lane stays dashed; converging elbows and horizontal
+/// stubs (which terminate at the node row) are dropped.
+fn continuation_cells(cells: &[Cell]) -> Vec<Cell> {
+    cells
+        .iter()
+        .map(|c| match c {
+            Cell::Vertical => Cell::Vertical,
+            Cell::Elided => Cell::Elided,
+            // Fork elbows open a new lane that descends from this row.
+            Cell::ElbowTopLeft | Cell::ElbowTopRight => Cell::Vertical,
+            // Converging elbows / horizontal stubs terminate at the node row.
+            _ => Cell::Empty,
+        })
+        .collect()
+}
 
 fn draw_cells(scene: &mut Scene, gx0: f64, y: f64, cells: &[Cell], graph: &[Color; 8]) {
     for (col, cell) in cells.iter().enumerate() {
@@ -253,16 +295,21 @@ fn draw_node_line(scene: &mut Scene, x: f64, cy: f64, n: &CommitNode, t: &Palett
         x = alert_badge(scene, x, cy, "conflict", t, ctx);
     }
 
-    let (desc, color) = if n.description.is_empty() {
+    // jj descriptions carry a trailing newline (and may be multi-line); lightjj
+    // shows only the first line. Take it and trim trailing whitespace so no
+    // control char renders as a `.notdef` box.
+    let first_line = n.description.lines().next().unwrap_or("").trim_end();
+    let (desc, color) = if first_line.is_empty() {
         let label = if n.is_empty { "(empty)" } else { "(no description)" };
-        (label.to_string(), t.overlay0)
+        (label, t.overlay0)
     } else if n.is_immutable {
         // Immutable description dimmed to overlay0.
-        (n.description.clone(), t.overlay0)
+        (first_line, t.overlay0)
     } else {
-        (n.description.clone(), t.text)
+        (first_line, t.text)
     };
-    text::draw_text(scene, &ctx.fonts.ui, font::FS_MD, color, x, baseline(cy, font::FS_MD), &desc);
+    let bl = baseline_for(cy, font::FS_MD, &ctx.fonts.ui);
+    text::draw_text(scene, &ctx.fonts.ui, font::FS_MD, color, x, bl, desc);
 }
 
 fn alert_badge(scene: &mut Scene, x: f64, cy: f64, label: &str, t: &Palette, ctx: &RenderCtx) -> f64 {
@@ -271,8 +318,9 @@ fn alert_badge(scene: &mut Scene, x: f64, cy: f64, label: &str, t: &Palette, ctx
     let r = Rect::new(x, cy - 7.0, x + w, cy + 7.0);
     fill_round(scene, r, 3.0, t.bg_error);
     scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, t.red, None, &r.to_rounded_rect(3.0));
-    text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.red, x + 4.0, baseline(cy, font::FS_XS), label);
-    x + w + 6.0
+    let bl = baseline_for(cy, font::FS_XS, &ctx.fonts.ui_bold);
+    text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.red, x + 4.0, bl, label);
+    x + w + NODE_LINE_GAP
 }
 
 fn draw_bookmark_line(
@@ -288,7 +336,9 @@ fn draw_bookmark_line(
     for b in &n.bookmarks {
         match &b.kind {
             BookmarkKind::Local => {
-                let base_label = format!("\u{2942} {}", b.name);
+                // Leading glyph is `⑂` (U+2442, branch fork) per §4.3; resolved via
+                // the symbol fallback chain in `text`.
+                let base_label = format!("\u{2442} {}", b.name);
                 let mut full = base_label.clone();
                 if b.conflicted {
                     full.push_str(" ??");
@@ -297,16 +347,18 @@ fn draw_bookmark_line(
                     full.push_str(" *");
                 }
                 let tw = text::measure(&ctx.fonts.ui, font::FS_XS, &full) as f64;
+                // padding 0 5 → 5px each side.
                 let w = tw + 10.0;
                 let r = Rect::new(x, cy - 8.0, x + w, cy + 8.0);
                 fill_round(scene, r, 3.0, t.surface0);
+                // Lane-tinted (border = lane@50%, text = lane) unless conflicted.
                 let (border, txt) = if b.conflicted {
                     (t.surface1, t.subtext0)
                 } else {
                     (theme::with_opacity(lane, 0.5), lane)
                 };
                 scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, border, None, &r.to_rounded_rect(3.0));
-                let bl = baseline(cy, font::FS_XS);
+                let bl = baseline_for(cy, font::FS_XS, &ctx.fonts.ui);
                 let mut mx = text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, txt, x + 5.0, bl, &base_label);
                 if b.conflicted {
                     mx = text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.red, mx + 2.0, bl, "??");
@@ -314,7 +366,7 @@ fn draw_bookmark_line(
                 if b.unsynced {
                     text::draw_text(scene, &ctx.fonts.ui_bold, font::FS_XS, t.amber, mx + 2.0, bl, "*");
                 }
-                x += w + 4.0;
+                x += w + BOOKMARK_GAP;
             }
             BookmarkKind::Remote { remote } => {
                 let label = format!("{}/{}", remote, b.name);
@@ -322,8 +374,9 @@ fn draw_bookmark_line(
                 let w = tw + 10.0;
                 let r = Rect::new(x, cy - 7.0, x + w, cy + 7.0);
                 scene.stroke(&Stroke::new(1.0), Affine::IDENTITY, t.surface0, None, &r.to_rounded_rect(3.0));
-                text::draw_text(scene, &ctx.fonts.ui, font::FS_2XS, t.overlay0, x + 5.0, baseline(cy, font::FS_2XS), &label);
-                x += w + 4.0;
+                let bl = baseline_for(cy, font::FS_2XS, &ctx.fonts.ui);
+                text::draw_text(scene, &ctx.fonts.ui, font::FS_2XS, t.overlay0, x + 5.0, bl, &label);
+                x += w + BOOKMARK_GAP;
             }
         }
     }
@@ -336,7 +389,7 @@ fn draw_meta_line(scene: &mut Scene, x: f64, cy: f64, n: &CommitNode, t: &Palett
     let tail_end = n.change_id.len().min(12);
     let prefix = &n.change_id[..plen.min(tail_end)];
     let tail = if plen < tail_end { &n.change_id[plen..tail_end] } else { "" };
-    let bl = baseline(cy, font::FS_SM);
+    let bl = baseline_for(cy, font::FS_SM, &ctx.fonts.mono);
     let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_SM, t.amber, x, bl, prefix);
     let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_SM, t.text_faint, end, bl, tail);
     let end = if n.is_divergent {
@@ -344,29 +397,48 @@ fn draw_meta_line(scene: &mut Scene, x: f64, cy: f64, n: &CommitNode, t: &Palett
     } else {
         end
     };
-    x = end + 8.0;
+    x = end + META_GAP;
 
     // Commit id: faint prefix-highlight + tail (to 12 chars), --fs-xs overlay0.
     let cplen = n.commit_prefix_len.min(n.commit_id.len());
     let ctail_end = n.commit_id.len().min(12);
     let cprefix = &n.commit_id[..cplen.min(ctail_end)];
     let ctail = if cplen < ctail_end { &n.commit_id[cplen..ctail_end] } else { "" };
-    let cbl = baseline(cy, font::FS_XS);
+    let cbl = baseline_for(cy, font::FS_XS, &ctx.fonts.mono);
     let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_XS, t.overlay0, x, cbl, cprefix);
     let end = text::draw_text(scene, &ctx.fonts.mono, font::FS_XS, t.text_faint, end, cbl, ctail);
-    x = end + 8.0;
+    x = end + META_GAP;
 
     // Relative timestamp chip.
     let ts = relative_time(n.timestamp_ms, NOW_MS);
-    text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, t.overlay0, x, baseline(cy, font::FS_XS), &ts);
+    let tbl = baseline_for(cy, font::FS_XS, &ctx.fonts.ui);
+    text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, t.overlay0, x, tbl, &ts);
 }
 
+/// Width (px) the `(elided revisions)` marker spans from the content x. lightjj
+/// does not stretch the dashed rules to the panel edge; matched to the reference.
+const ELIDED_RULE_W: f64 = 205.0;
+
 fn draw_elided(scene: &mut Scene, x: f64, x1: f64, y: f64, t: &Palette, ctx: &RenderCtx) {
+    // §4.6: `(elided revisions)` label, --text-faint --fs-xs, *centered* between two
+    // 1px dashed --surface1 rules. The rules span a fixed marker width (not the whole
+    // panel), so the label sits left-of-panel-center as in the reference.
     let cy = y + L::ROW_H * 0.5;
-    let bl = baseline(cy, font::FS_XS);
-    let end = text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, t.text_faint, x, bl, "(elided revisions)");
+    let bl = baseline_for(cy, font::FS_XS, &ctx.fonts.ui);
+    const LABEL: &str = "(elided revisions)";
+    const RULE_GAP: f64 = 8.0; // gap between a rule and the label.
+    let tw = text::measure(&ctx.fonts.ui, font::FS_XS, LABEL) as f64;
+    let right = (x + ELIDED_RULE_W).min(x1 - RULE_GAP);
+    let avail = (right - x).max(tw);
+    let text_x = x + (avail - tw) * 0.5;
+    let end = text::draw_text(scene, &ctx.fonts.ui, font::FS_XS, t.text_faint, text_x, bl, LABEL);
     let stroke = Stroke::new(1.0).with_dashes(0.0, [2.0, 2.0]);
-    scene.stroke(&stroke, Affine::IDENTITY, t.surface1, None, &Line::new((end + 8.0, cy), (x1 - 8.0, cy)));
+    if text_x - RULE_GAP > x {
+        scene.stroke(&stroke, Affine::IDENTITY, t.surface1, None, &Line::new((x, cy), (text_x - RULE_GAP, cy)));
+    }
+    if right > end + RULE_GAP {
+        scene.stroke(&stroke, Affine::IDENTITY, t.surface1, None, &Line::new((end + RULE_GAP, cy), (right, cy)));
+    }
 }
 
 // --- relative time ---------------------------------------------------------
@@ -407,5 +479,29 @@ mod tests {
         assert_eq!(relative_time(now - 2 * 86_400_000, now), "2d");
         // 2026-01-15 -> 2026-06-19 is ~5 months.
         assert_eq!(relative_time(1_768_471_200_000, now), "5mo");
+    }
+
+    #[test]
+    fn continuation_cells_keeps_through_lanes_drops_terminating_connectors() {
+        // A merge row (`feat`): own lane vertical/elided + a converging child via an
+        // elbow + horizontal stub. The continuation rows below it must keep only the
+        // lanes that exit the bottom: the elided trunk stays dashed, the converging
+        // elbow and its horizontal stub vanish (the child lane ended at the node row).
+        let cells = vec![Cell::Elided, Cell::Horizontal, Cell::ElbowBottomLeft];
+        assert_eq!(
+            continuation_cells(&cells),
+            vec![Cell::Elided, Cell::Empty, Cell::Empty]
+        );
+
+        // A fork row: node trunk vertical + a newly opened lane (top elbow). Both
+        // lanes descend, so the fork elbow becomes a vertical on continuation rows.
+        let cells = vec![Cell::Vertical, Cell::Horizontal, Cell::ElbowTopLeft];
+        assert_eq!(
+            continuation_cells(&cells),
+            vec![Cell::Vertical, Cell::Empty, Cell::Vertical]
+        );
+
+        // A plain carried lane stays a vertical through the whole revision.
+        assert_eq!(continuation_cells(&[Cell::Vertical]), vec![Cell::Vertical]);
     }
 }
