@@ -1,0 +1,10 @@
+[user]
+name = "Ada Lovelace"
+email = "ada@example.com"
+
+[revset-aliases]
+# Make the `main` bookmark and everything under it immutable (◆ in the UI).
+"immutable_heads()" = "present(main) | tags()"
+
+[ui]
+color = "never"

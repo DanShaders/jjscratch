@@ -18,9 +18,21 @@ set -euo pipefail
 # ---- paths -----------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"           # /home/danklishch/work/jjscratch
-TOOLS="$ROOT/tools"
-FIXTURE_REPO="$ROOT/fixture/repo"
-JJCONFIG="$ROOT/fixture/jjconfig.toml"
+
+# Toolchains (jj/node/lightjj/chrome-deps/refharness) only ever live in the
+# SHARED checkout's tools/ — git worktrees don't get their own copy. Prefer this
+# checkout's tools/ if it actually holds the lightjj binary; otherwise fall back
+# to the shared checkout. Overridable via $TOOLS.
+TOOLS="${TOOLS:-$ROOT/tools}"
+if [ ! -x "$TOOLS/bin/lightjj" ]; then
+  TOOLS="/home/danklishch/work/jjscratch/tools"
+fi
+
+# Fixture is per-checkout (committed), so it stays relative to $ROOT. Both the
+# repo and its jj config are overridable so the merge scene can point lightjj at
+# the conflict fixture (fixture-conflict/) instead of the shared one.
+FIXTURE_REPO="${FIXTURE_REPO:-$ROOT/fixture/repo}"
+JJCONFIG="${JJCONFIG:-$ROOT/fixture/jjconfig.toml}"
 OUT_DIR="$ROOT/docs/reference"
 
 # Local toolchains (downloaded into tools/, never system-wide).
