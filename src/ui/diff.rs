@@ -159,16 +159,18 @@ fn files_bar(scene: &mut Scene, rect: Rect, y: f64, diff: &CommitDiff, ctx: &Ren
     let added = diff.total_added();
     let removed = diff.total_removed();
     x += 10.0;
+    // `.total-stats` is `font-family: inherit` (body `--font-ui`), weight 600 —
+    // the aggregate +/- counts are sans (Inter ui_bold), NOT mono.
     let pa = format!("+{added}");
     x = text::draw_text(
-        scene, &ctx.fonts.mono_bold, font::FS_SM, t.green,
-        x, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &pa,
+        scene, &ctx.fonts.ui_bold, font::FS_SM, t.green,
+        x, baseline_for(cy, font::FS_SM, &ctx.fonts.ui_bold), &pa,
     );
     x += 6.0;
     let pr = format!("-{removed}");
     x = text::draw_text(
-        scene, &ctx.fonts.mono_bold, font::FS_SM, t.red,
-        x, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &pr,
+        scene, &ctx.fonts.ui_bold, font::FS_SM, t.red,
+        x, baseline_for(cy, font::FS_SM, &ctx.fonts.ui_bold), &pr,
     );
 
     // File tabs.
@@ -199,9 +201,12 @@ fn files_bar(scene: &mut Scene, rect: Rect, y: f64, diff: &CommitDiff, ctx: &Ren
         } else {
             (format!("+{} -{}", file.added, file.removed), t.subtext0)
         };
+        // `.file-tab-stats` is `font-family: inherit` (the diff panel inherits
+        // body `--font-ui`) — the +/- counts in the file-tab strip are sans
+        // (Inter), NOT mono. (Only diff-line code + hunk headers are mono.)
         let after_stat = text::draw_text(
-            scene, &ctx.fonts.mono, font::FS_XS, scol,
-            nx, baseline_for(cy, font::FS_XS, &ctx.fonts.mono), &stat,
+            scene, &ctx.fonts.ui, font::FS_XS, scol,
+            nx, baseline_for(cy, font::FS_XS, &ctx.fonts.ui), &stat,
         );
 
         if active {
@@ -336,21 +341,23 @@ fn file_block(
     let cbx = Rect::new(rx - 14.0, cy - 7.0, rx, cy + 7.0);
     stroke_rect(scene, cbx, t.surface2, 1.0);
     rx = cbx.x0 - 10.0;
+    // `.file-stats`/`.stat-add`/`.stat-del` inherit body `--font-ui` — the
+    // per-file +/- counts in the diff-file header are sans (Inter), not mono.
     if file.removed > 0 {
         let pr = format!("-{}", file.removed);
-        let w = text::measure(&ctx.fonts.mono_bold, font::FS_SM, &pr) as f64;
+        let w = text::measure(&ctx.fonts.ui_bold, font::FS_SM, &pr) as f64;
         text::draw_text(
-            scene, &ctx.fonts.mono_bold, font::FS_SM, t.red,
-            rx - w, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &pr,
+            scene, &ctx.fonts.ui_bold, font::FS_SM, t.red,
+            rx - w, baseline_for(cy, font::FS_SM, &ctx.fonts.ui_bold), &pr,
         );
         rx -= w + 6.0;
     }
     if file.added > 0 {
         let pa = format!("+{}", file.added);
-        let w = text::measure(&ctx.fonts.mono_bold, font::FS_SM, &pa) as f64;
+        let w = text::measure(&ctx.fonts.ui_bold, font::FS_SM, &pa) as f64;
         text::draw_text(
-            scene, &ctx.fonts.mono_bold, font::FS_SM, t.green,
-            rx - w, baseline_for(cy, font::FS_SM, &ctx.fonts.mono_bold), &pa,
+            scene, &ctx.fonts.ui_bold, font::FS_SM, t.green,
+            rx - w, baseline_for(cy, font::FS_SM, &ctx.fonts.ui_bold), &pa,
         );
     }
 

@@ -207,16 +207,18 @@ impl FrameLayout {
 
         let divider = Rect::new(panel_w, body_top, panel_w + L::PANEL_DIVIDER_W, body_bot);
         let diff_x = divider.x1;
-        // The Revisions view has NO "CHANGES" chrome title bar: lightjj's
-        // RevisionHeader (drawn by diff.rs) is the very top of the panel. Other
-        // views keep a panel header. When there's no header, the diff content
-        // spans the full body height starting at `body_top`.
-        let (diff_header, diff_content) = if view == View::Revisions {
-            (None, Rect::new(diff_x, body_top, w, body_bot))
-        } else {
+        // Neither the Revisions NOR the Branches view has a chrome title bar:
+        // lightjj's RevisionHeader (Revisions, drawn by diff.rs) and the
+        // BookmarksPanel's own `.bp-header` (Branches) are the very top of the
+        // right column — there is no "DIFF"/"BRANCHES" panel-header above them.
+        // Only the Merge placeholder keeps a chrome header. When there's no
+        // header, the content spans the full body height from `body_top`.
+        let (diff_header, diff_content) = if view == View::Merge {
             let header = Rect::new(diff_x, body_top, w, body_top + L::PANEL_HEADER_H);
             let content = Rect::new(diff_x, header.y1, w, body_bot);
             (Some(header), content)
+        } else {
+            (None, Rect::new(diff_x, body_top, w, body_bot))
         };
 
         let statusbar = Rect::new(0.0, statusbar_top, w, h);
@@ -288,13 +290,11 @@ pub fn build_scene(
 
     // Right column: dispatch on the active view.
     match state.active_view {
-        // Branches view — the bookmarks list replaces the diff panel, under a
-        // "BRANCHES" panel header (lightjj BookmarksPanel.svelte).
+        // Branches view — the bookmarks list replaces the diff panel. lightjj's
+        // BookmarksPanel has NO chrome title bar: its own `.bp-header` (filter
+        // input + sort control + count) is the top of the column, so the panel
+        // fills the whole right column from `body_top` with no header above it.
         View::Branches => {
-            let header = fl
-                .diff_header
-                .unwrap_or_else(|| Rect::new(fl.divider.x1, fl.diff_content.y0, width, fl.diff_content.y0));
-            draw_panel_header(scene, header, "BRANCHES", None, false, ctx);
             branches::render(scene, fl.diff_content, snapshot, ctx);
         }
         // Merge view — full merge surface is out of scope; show a placeholder
@@ -414,13 +414,15 @@ fn draw_toolbar(
     // 2. divider.
     x = toolbar_divider(scene, x, bar, t) + TOOLBAR_GAP;
 
-    // 3. Workspace selector pill (◇ default ▾).
+    // 3. Workspace selector pill (◇ default ▾). lightjj's markup places the
+    // `.seg` nav control DIRECTLY after the workspace pill — there is NO
+    // `.toolbar-divider` between them (the toolbar's only dividers are
+    // logo↔pill, seg↔drawer-toggles, and drawer-toggles↔search). An extra
+    // divider here was pushing the whole `◉ Revisions` control ~7px right of
+    // the reference (compare2 REAL component #1, the gap before the ◉ glyph).
     x = workspace_pill(scene, x, bar, &snapshot.workspace_name, ctx) + TOOLBAR_GAP;
 
-    // 4. divider.
-    x = toolbar_divider(scene, x, bar, t) + TOOLBAR_GAP;
-
-    // 5. Nav tabs = a `.seg` segmented control with three `.seg-btn`.
+    // 4. Nav tabs = a `.seg` segmented control with three `.seg-btn`.
     // Icon + word kept separate so the icon gets its own metric-centered baseline
     // (it resolves in a symbol fallback font with different vertical metrics than
     // Inter; see `draw_icon_label`). Codepoints match lightjj's toolbar markup
@@ -432,18 +434,18 @@ fn draw_toolbar(
     ];
     x = seg_control(scene, x, bar, &tabs, state.active_view, ctx) + TOOLBAR_GAP;
 
-    // 6. divider.
+    // 5. divider.
     x = toolbar_divider(scene, x, bar, t) + TOOLBAR_GAP;
 
-    // 7. Drawer toggles (borderless `.toolbar-nav-btn`).
+    // 6. Drawer toggles (borderless `.toolbar-nav-btn`).
     for (icon, word, key) in [("\u{27f2}", "Oplog", "4"), ("\u{25d0}", "Evolog", "5")] {
         x = nav_btn(scene, x, bar, icon, word, key, ctx);
     }
 
-    // 8. divider.
+    // 7. divider.
     x = toolbar_divider(scene, x + (TOOLBAR_GAP - 4.0), bar, t) + TOOLBAR_GAP;
 
-    // 9. Search button (`Search…` + ⌘K/Ctrl+K kbd chip).
+    // 8. Search button (`Search…` + ⌘K/Ctrl+K kbd chip).
     search_button(scene, x, bar, ctx);
 
     // Right group (space-between): theme toggle glyph at the far right. lightjj
@@ -485,10 +487,11 @@ fn draw_tab_bar(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx, snapshot: 
     let tab_x1 = end + tab_pad;
     fill_rect(scene, Rect::new(tab_x0, bar.y1 - 2.0, tab_x1, bar.y1), t.amber);
 
-    // `.tab-new` `+` affordance: --fs-lg, --text-faint.
+    // `.tab-new` `+` affordance: --fs-lg, --text-faint. `.tab-new` is `font:
+    // inherit` under the `.tab-bar`'s `--font-mono`, so the `+` is mono.
     text::draw_text(
-        scene, &ctx.fonts.ui, theme::font::FS_LG, t.text_faint,
-        tab_x1 + 13.0, baseline_for(cy, theme::font::FS_LG, &ctx.fonts.ui), "+",
+        scene, &ctx.fonts.mono, theme::font::FS_LG, t.text_faint,
+        tab_x1 + 13.0, baseline_for(cy, theme::font::FS_LG, &ctx.fonts.mono), "+",
     );
 }
 
@@ -499,10 +502,12 @@ fn draw_revset_bar(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx) {
     border_bottom(scene, r, t.surface0);
     let cy = r.center().y;
     let sz = theme::font::FS_MD;
-    // "$" icon: --text-faint, --fs-md, weight 700.
+    // "$" icon: `.revset-icon` is a bare <span> — no font-family override, so it
+    // inherits body's `--font-ui` (Inter), NOT mono. --text-faint, --fs-md,
+    // weight 700 (use ui_bold for the 700 weight).
     let icon_end = text::draw_text(
-        scene, &ctx.fonts.mono, sz, t.text_faint,
-        r.x0 + REVSET_PAD_X, baseline_for(cy, sz, &ctx.fonts.mono), "$",
+        scene, &ctx.fonts.ui_bold, sz, t.text_faint,
+        r.x0 + REVSET_PAD_X, baseline_for(cy, sz, &ctx.fonts.ui_bold), "$",
     );
     // Trailing `?` help button (circular, --text-faint, 1px --surface1 border),
     // right-anchored at the bar's padding edge.
@@ -526,12 +531,13 @@ fn draw_revset_bar(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx) {
     );
     fill_round(scene, input, 3.0, t.base);
     stroke_round(scene, input, 3.0, t.surface1, 1.0);
-    // Placeholder (the default revset), color --surface1 per spec. Clipped to the
-    // input box so our wider mono can't bleed the text over the `?` button.
+    // Placeholder (the default revset), color --surface1 per spec. `.revset-input`
+    // is `font-family: inherit` → body `--font-ui` (Inter, sans) — NOT mono.
+    // Clipped to the input box so the text can't bleed over the `?` button.
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &input);
     text::draw_text(
-        scene, &ctx.fonts.mono, sz, t.surface2,
-        input.x0 + 6.0 + REVSET_INPUT_PAD_Y, baseline_for(input.center().y, sz, &ctx.fonts.mono),
+        scene, &ctx.fonts.ui, sz, t.surface2,
+        input.x0 + 6.0 + REVSET_INPUT_PAD_Y, baseline_for(input.center().y, sz, &ctx.fonts.ui),
         "present(@) | ancestors(immutable_heads().., 2) | trunk()",
     );
     scene.pop_layer();
