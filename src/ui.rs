@@ -7,10 +7,13 @@
 //! `render(scene, rect, ..., ctx)` and paints ONLY within `rect`. The shell and
 //! layout are stable; implement the panels against this interface.
 
+pub mod branches;
 pub mod diff;
 pub mod graph;
+pub mod oplog;
+pub mod palette;
 
-use vello::kurbo::{Affine, Line, Rect, Stroke};
+use vello::kurbo::{Affine, BezPath, Cap, Join, Line, Rect, Stroke};
 use vello::peniko::{Color, Fill};
 use vello::Scene;
 
@@ -67,10 +70,30 @@ pub enum View {
     Merge,
 }
 
+/// Theme polarity. `build_scene` resolves this to a [`Palette`] each frame so
+/// the whole UI re-themes at runtime (lightjj's `t` key toggles dark/light).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Theme {
+    Dark,
+    Light,
+}
+
+impl Theme {
+    /// The concrete palette for this polarity.
+    pub fn palette(self) -> &'static Palette {
+        match self {
+            Theme::Dark => &theme::DARK,
+            Theme::Light => &theme::LIGHT,
+        }
+    }
+}
+
 /// Mutable UI state the renderer reads (cursor, scroll, sizing).
 #[derive(Clone, Debug)]
 pub struct UiState {
     pub active_view: View,
+    /// Active theme polarity; `build_scene` picks the palette from this.
+    pub theme: Theme,
     /// Index into `snapshot.nodes` of the selected revision.
     pub selected: usize,
     /// Hovered revision index (JS-tracked hover in lightjj), if any.
@@ -80,22 +103,51 @@ pub struct UiState {
     pub graph_scroll: f64,
     /// Vertical scroll offset (px) of the diff content.
     pub diff_scroll: f64,
+    /// Oplog bottom-drawer open (lightjj's `4` toggle).
+    pub oplog_open: bool,
+    /// Evolog bottom-drawer open (lightjj's `5` toggle).
+    pub evolog_open: bool,
+    /// Command-palette overlay open (Cmd+K / Ctrl+K).
+    pub palette_open: bool,
+    /// Live command-palette query (drives the input row + fuzzy filter).
+    pub palette_query: String,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             active_view: View::Revisions,
+            theme: Theme::Dark,
             selected: 0,
             hovered: None,
             panel_width: L::REVISION_PANEL_DEFAULT_W,
             graph_scroll: 0.0,
             diff_scroll: 0.0,
+            oplog_open: false,
+            evolog_open: false,
+            palette_open: false,
+            palette_query: String::new(),
         }
     }
 }
 
-/// Shared rendering context: fonts + active theme palette.
+/// Per-frame inputs beyond the [`Snapshot`]/[`UiState`]: data the drawers need
+/// that the callers (`shot`/`drive`) load from the backend. Kept as a small
+/// struct so `build_scene`'s signature is stable as new drawers land.
+#[derive(Default)]
+pub struct Frame<'a> {
+    /// Operation-log entries (newest-first), shown by the Oplog drawer. Only
+    /// populated under the `jjlib` feature; empty otherwise (the mock build
+    /// has no op-store, so the drawer renders its empty state).
+    #[cfg(feature = "jjlib")]
+    pub oplog: &'a [crate::model::jjlib::OpEntry],
+    /// Lifetime anchor so the struct is generic over `'a` in every build.
+    pub _marker: std::marker::PhantomData<&'a ()>,
+}
+
+/// Shared rendering context: fonts + active theme palette. STABLE shape —
+/// `graph`/`diff`/`branches`/`oplog`/`palette` all read `ctx.theme: &Palette`.
+/// `build_scene` constructs this each frame from the state-selected palette.
 pub struct RenderCtx<'a> {
     pub fonts: &'a Fonts,
     pub theme: &'a Palette,
@@ -116,11 +168,19 @@ pub struct FrameLayout {
     /// of the diff panel, with no chrome title bar above it.
     pub diff_header: Option<Rect>,
     pub diff_content: Rect,
+    /// Open bottom drawer (Oplog/Evolog), spanning the full width above the
+    /// statusbar. `None` when no drawer is open. When present, the body areas
+    /// above (graph/diff/branches) are shortened to `drawer.y0`.
+    pub drawer: Option<Rect>,
     pub statusbar: Rect,
 }
 
+/// Height of an open bottom drawer (Oplog/Evolog). lightjj's `.oplog-panel`
+/// floats above the statusbar; ~38% of an 800px frame reads like the reference.
+const DRAWER_H: f64 = 300.0;
+
 impl FrameLayout {
-    pub fn compute(w: f64, h: f64, panel_w: f64, view: View) -> Self {
+    pub fn compute(w: f64, h: f64, panel_w: f64, view: View, drawer_open: bool) -> Self {
         let panel_w = panel_w.clamp(L::REVISION_PANEL_MIN_W, L::REVISION_PANEL_MAX_W);
         let mut y = 0.0;
         let toolbar = Rect::new(0.0, y, w, y + L::TOOLBAR_H);
@@ -128,7 +188,16 @@ impl FrameLayout {
         let tab_bar = Rect::new(0.0, y, w, y + L::TAB_BAR_H);
         y += L::TAB_BAR_H;
         let body_top = y;
-        let body_bot = h - L::STATUSBAR_H;
+        let statusbar_top = h - L::STATUSBAR_H;
+        // An open drawer steals a band off the bottom of the body, sitting just
+        // above the statusbar; the body bottom rises to the drawer top.
+        let drawer = if drawer_open {
+            let dh = DRAWER_H.min((statusbar_top - body_top).max(0.0) * 0.6);
+            Some(Rect::new(0.0, statusbar_top - dh, w, statusbar_top))
+        } else {
+            None
+        };
+        let body_bot = drawer.map(|d| d.y0).unwrap_or(statusbar_top);
 
         let revset_bar = Rect::new(0.0, body_top, panel_w, body_top + L::REVSET_BAR_H);
         let preset_chips = Rect::new(0.0, revset_bar.y1, panel_w, revset_bar.y1 + PRESET_CHIPS_H);
@@ -150,7 +219,7 @@ impl FrameLayout {
             (Some(header), content)
         };
 
-        let statusbar = Rect::new(0.0, body_bot, w, h);
+        let statusbar = Rect::new(0.0, statusbar_top, w, h);
 
         Self {
             toolbar,
@@ -162,23 +231,36 @@ impl FrameLayout {
             divider,
             diff_header,
             diff_content,
+            drawer,
             statusbar,
         }
     }
 }
 
 /// Build the full-window scene. `width`/`height` are logical px.
+///
+/// The caller passes `fonts` + the full `state` (and per-frame `frame` inputs);
+/// `build_scene` resolves the active [`Palette`] from `state.theme` and builds
+/// the [`RenderCtx`] the content renderers consume, so the whole UI re-themes
+/// at runtime when `state.theme` flips (the `t` key). The `RenderCtx` shape is
+/// stable — graph/diff/branches/oplog all read `ctx.theme: &Palette` unchanged.
 pub fn build_scene(
     scene: &mut Scene,
     snapshot: &Snapshot,
     diff: Option<&CommitDiff>,
     state: &UiState,
-    ctx: &RenderCtx,
+    fonts: &Fonts,
+    frame: &Frame,
     width: f64,
     height: f64,
 ) {
+    // Resolve the palette from state this frame; construct the (stable) ctx.
+    let palette = *state.theme.palette();
+    let ctx = &RenderCtx { fonts, theme: &palette };
     let t = ctx.theme;
-    let fl = FrameLayout::compute(width, height, state.panel_width, state.active_view);
+
+    let drawer_open = state.oplog_open || state.evolog_open;
+    let fl = FrameLayout::compute(width, height, state.panel_width, state.active_view, drawer_open);
 
     // Base background (everything paints on top).
     fill_rect(scene, Rect::new(0.0, 0.0, width, height), t.base);
@@ -186,7 +268,9 @@ pub fn build_scene(
     draw_toolbar(scene, &fl, ctx, state, snapshot);
     draw_tab_bar(scene, &fl, ctx, snapshot);
 
-    // Revision panel chrome.
+    // Revision panel chrome (the left column keeps the graph in every view —
+    // lightjj only HIDES it in the Merge view; Branches keeps it as a sibling
+    // and fills the RIGHT column with the bookmarks list).
     draw_revset_bar(scene, &fl, ctx);
     draw_preset_chips(scene, &fl, ctx);
     draw_panel_header(
@@ -202,14 +286,107 @@ pub fn build_scene(
     // Divider.
     fill_rect(scene, fl.divider, t.surface1);
 
-    // Diff panel chrome + content. In the Revisions view there is no "CHANGES"
-    // title bar — the RevisionHeader (drawn inside diff::render) is the panel top.
-    if let Some(diff_header) = fl.diff_header {
-        draw_panel_header(scene, diff_header, "DIFF", None, false, ctx);
+    // Right column: dispatch on the active view.
+    match state.active_view {
+        // Branches view — the bookmarks list replaces the diff panel, under a
+        // "BRANCHES" panel header (lightjj BookmarksPanel.svelte).
+        View::Branches => {
+            let header = fl
+                .diff_header
+                .unwrap_or_else(|| Rect::new(fl.divider.x1, fl.diff_content.y0, width, fl.diff_content.y0));
+            draw_panel_header(scene, header, "BRANCHES", None, false, ctx);
+            branches::render(scene, fl.diff_content, snapshot, ctx);
+        }
+        // Merge view — full merge surface is out of scope; show a placeholder
+        // panel so the view is reachable without rendering a misleading diff.
+        View::Merge => {
+            if let Some(header) = fl.diff_header {
+                draw_panel_header(scene, header, "MERGE", None, false, ctx);
+            }
+            draw_merge_placeholder(scene, fl.diff_content, ctx);
+        }
+        // Revisions view — the diff panel. No "CHANGES" title bar: the
+        // RevisionHeader (drawn inside diff::render) is the panel top.
+        View::Revisions => {
+            if let Some(diff_header) = fl.diff_header {
+                draw_panel_header(scene, diff_header, "DIFF", None, false, ctx);
+            }
+            diff::render(scene, fl.diff_content, snapshot, diff, state, ctx);
+        }
     }
-    diff::render(scene, fl.diff_content, snapshot, diff, state, ctx);
+
+    // Bottom drawer (Oplog/Evolog), above the statusbar.
+    if let Some(drawer) = fl.drawer {
+        draw_drawer(scene, drawer, state, frame, ctx);
+    }
 
     draw_statusbar(scene, &fl, ctx, snapshot);
+
+    // Command palette overlay, on top of everything.
+    if state.palette_open {
+        let viewport = Rect::new(0.0, 0.0, width, height);
+        palette::render(scene, viewport, &state.palette_query, ctx);
+    }
+}
+
+/// Render the open bottom drawer. Oplog uses the real op-log renderer (fed the
+/// ops loaded by the caller); Evolog is a placeholder until its data path lands.
+fn draw_drawer(scene: &mut Scene, drawer: Rect, state: &UiState, frame: &Frame, ctx: &RenderCtx) {
+    let t = ctx.theme;
+    // 1px top border separating the drawer from the body above it.
+    fill_rect(scene, Rect::new(drawer.x0, drawer.y0, drawer.x1, drawer.y0 + 1.0), t.surface1);
+    let body = Rect::new(drawer.x0, drawer.y0 + 1.0, drawer.x1, drawer.y1);
+
+    if state.oplog_open {
+        #[cfg(feature = "jjlib")]
+        {
+            oplog::render(scene, body, frame.oplog, ctx);
+        }
+        #[cfg(not(feature = "jjlib"))]
+        {
+            // No op-store without the jjlib feature; show the drawer chrome
+            // with an empty-state message so the toggle is still visible.
+            let _ = frame;
+            draw_drawer_placeholder(scene, body, "OPERATION LOG", "No operations (mock build)", ctx);
+        }
+    } else if state.evolog_open {
+        draw_drawer_placeholder(scene, body, "EVOLUTION LOG", "Evolution log — not yet wired", ctx);
+    }
+}
+
+/// A minimal drawer placeholder: panel header + a centered faint message.
+/// Used for the Evolog drawer (no renderer yet) and the non-jjlib Oplog.
+fn draw_drawer_placeholder(scene: &mut Scene, rect: Rect, title: &str, msg: &str, ctx: &RenderCtx) {
+    let t = ctx.theme;
+    fill_rect(scene, rect, t.base);
+    let header = Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + L::PANEL_HEADER_H);
+    fill_rect(scene, header, t.mantle);
+    border_bottom(scene, header, t.surface0);
+    let hcy = header.center().y;
+    let hsz = theme::font::FS_SM;
+    text::draw_text(
+        scene, &ctx.fonts.ui_bold, hsz, t.subtext1,
+        header.x0 + 12.0, baseline_for(hcy, hsz, &ctx.fonts.ui_bold), title,
+    );
+    let sz = theme::font::BASE;
+    let w = text::measure(&ctx.fonts.ui, sz, msg) as f64;
+    text::draw_text(
+        scene, &ctx.fonts.ui, sz, t.text_faint,
+        rect.center().x - w / 2.0, header.y1 + 40.0, msg,
+    );
+}
+
+/// Merge-view placeholder panel (full 3-pane merge surface is out of scope).
+fn draw_merge_placeholder(scene: &mut Scene, rect: Rect, ctx: &RenderCtx) {
+    let t = ctx.theme;
+    fill_rect(scene, rect, t.base);
+    let msg = "Merge view — not yet implemented";
+    let sz = theme::font::FS_LG;
+    let w = text::measure(&ctx.fonts.ui, sz, msg) as f64;
+    text::draw_text(
+        scene, &ctx.fonts.ui, sz, t.text_faint,
+        rect.center().x - w / 2.0, rect.center().y, msg,
+    );
 }
 
 // --- chrome ---------------------------------------------------------------
@@ -229,9 +406,9 @@ fn draw_toolbar(
     let cy = bar.center().y;
     let mut x = TOOLBAR_PAD_X;
 
-    // 1. Logo: 16×16 svg. lightjj's mark is a thin amber lightning bolt; we
-    // approximate it as a filled zig-zag glyph centered in the 16px logo box.
-    draw_logo_bolt(scene, x + 8.0, cy, t.amber);
+    // 1. Logo: the actual lightjj `/logo.svg` mark — a stroked amber lightning
+    // bolt with node dots — drawn from its real BezPaths into the 16px box.
+    draw_logo(scene, x, cy, 16.0, t.amber);
     x += 16.0 + TOOLBAR_GAP;
 
     // 2. divider.
@@ -458,29 +635,61 @@ fn draw_statusbar(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx, snapshot
 
 // --- toolbar pieces -------------------------------------------------------
 
-/// lightjj's logo mark: a thin amber lightning bolt. Drawn as a filled zig-zag
-/// polygon centered on `(cx, cy)`, sized to sit inside the 16px logo box.
-fn draw_logo_bolt(scene: &mut Scene, cx: f64, cy: f64, color: Color) {
-    use vello::kurbo::BezPath;
-    // Bolt spans ~6px wide × ~14px tall; a slim "Z" stroke with two kicks.
-    let (hw, hh) = (3.2, 7.0); // half-width, half-height of the bolt box
-    let l = cx - hw;
-    let r = cx + hw;
-    let top = cy - hh;
-    let bot = cy + hh;
-    let mid = cy;
-    let w = 2.0; // bolt thickness
-    let mut p = BezPath::new();
-    // Down-stroke from top-right to the left-of-center midpoint, then the
-    // notch back out, then continuing down to the bottom-left tip.
-    p.move_to((r, top));
-    p.line_to((l + w, mid - 1.0));
-    p.line_to((cx, mid - 1.0));
-    p.line_to((l, bot));
-    p.line_to((r - w, mid + 1.0));
-    p.line_to((cx, mid + 1.0));
-    p.close_path();
-    scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &p);
+/// lightjj's `/logo.svg` mark: an amber lightning bolt traced as a stroked
+/// polyline with round caps/joins, a fainter spark tail, and node dots — drawn
+/// directly from the SVG's coordinates. The SVG authoring space is the 80×80
+/// `viewBox`; we map it into a `box_sz`-px box whose left edge is at `x` and
+/// vertically centered on `cy` (so it matches lightjj's 16px toolbar logo).
+///
+/// Reference (frontend/public/logo.svg):
+/// ```text
+/// <path d="M46,8 L30,34 L46,36 L32,56" stroke-width=3.5 round caps/joins/>
+/// <path d="M46,36 L58,58" stroke-width=2.5 opacity=0.65/>
+/// <circle 46,8 r4/> <circle 38,35 r2/> <circle 32,56 r3.5/>
+/// <circle 58,58 r2.5 opacity=0.65/>
+/// ```
+fn draw_logo(scene: &mut Scene, x: f64, cy: f64, box_sz: f64, color: Color) {
+    let s = box_sz / 80.0; // viewBox (80) → box scale
+    // Map an SVG-space point into device space (left-aligned at `x`, centered cy).
+    let p = |px: f64, py: f64| (x + px * s, cy + (py - 40.0) * s);
+    let faint = color.multiply_alpha(0.65);
+
+    let round = |w: f64| {
+        Stroke::new(w * s)
+            .with_caps(Cap::Round)
+            .with_join(Join::Round)
+    };
+
+    // Main bolt: M46,8 L30,34 L46,36 L32,56
+    let mut bolt = BezPath::new();
+    bolt.move_to(p(46.0, 8.0));
+    bolt.line_to(p(30.0, 34.0));
+    bolt.line_to(p(46.0, 36.0));
+    bolt.line_to(p(32.0, 56.0));
+    scene.stroke(&round(3.5), Affine::IDENTITY, color, None, &bolt);
+
+    // Spark tail: M46,36 L58,58 (thinner, fainter).
+    let mut tail = BezPath::new();
+    tail.move_to(p(46.0, 36.0));
+    tail.line_to(p(58.0, 58.0));
+    scene.stroke(&round(2.5), Affine::IDENTITY, faint, None, &tail);
+
+    // Node dots.
+    let dot = |scene: &mut Scene, cxp: f64, cyp: f64, r: f64, col: Color| {
+        let (dx, dy) = p(cxp, cyp);
+        let rr = r * s;
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            col,
+            None,
+            &vello::kurbo::Circle::new((dx, dy), rr),
+        );
+    };
+    dot(scene, 46.0, 8.0, 4.0, color);
+    dot(scene, 38.0, 35.0, 2.0, color);
+    dot(scene, 32.0, 56.0, 3.5, color);
+    dot(scene, 58.0, 58.0, 2.5, faint);
 }
 
 /// `.toolbar-divider`: 1px wide × 14px tall, bg --surface1. Returns its right x.

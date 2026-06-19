@@ -1,4 +1,4 @@
-//! Command palette (Cmd+K) overlay renderer — a self-contained, bin-local module.
+//! Command palette (Cmd+K) overlay renderer.
 //!
 //! Draws lightjj's command palette (frontend/src/lib/CommandPalette.svelte): a
 //! dimmed backdrop over the whole viewport, a centered modal (per ui-spec §6.4
@@ -7,52 +7,15 @@
 //! optional kbd shortcuts / submenu chevrons, the active row highlighted, and a
 //! key-footer hint bar.
 //!
-//! It paints only with the public helpers from `jjscratch::ui` so it composes
-//! over a real `build_scene` frame as an overlay.
-//!
-//! INTEGRATION: move to src/ui/palette.rs; show as overlay when Cmd+K active; wire query/selection into UiState + input.rs
+//! It paints only with the helpers from `super` so it composes over a real
+//! `build_scene` frame as an overlay. `ui::build_scene` dispatches here when
+//! `palette_open` is set, passing the live `palette_query`.
 
-use jjscratch::theme::{font, Palette};
-use jjscratch::ui::{baseline_for, fill_rect, fill_round, stroke_round, RenderCtx};
-use jjscratch::text;
+use crate::theme::{font, Palette};
+use super::{baseline_for, fill_rect, fill_round, stroke_round, RenderCtx};
+use crate::text;
 use vello::kurbo::Rect;
 use vello::Scene;
-
-/// Standalone preview: render the palette over a plain dark backdrop (no UI
-/// frame, no jj-lib needed) so this file is also a runnable `--bin`.
-///
-/// `cargo run --bin palette_view -- [out.png] [w] [h] [query]`
-///
-/// (When this file is included as a bin-local `mod palette_view` by
-/// `preview_palette`, this `main` is simply an unused module item — the outer
-/// bin owns the real entry point. See `#[allow(dead_code)]` below.)
-#[allow(dead_code)]
-fn main() -> anyhow::Result<()> {
-    use jjscratch::text::Fonts;
-    use jjscratch::{theme, Headless};
-
-    let mut args = std::env::args().skip(1);
-    let out = args.next().unwrap_or_else(|| "palette_view.png".to_string());
-    let width: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1280);
-    let height: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(800);
-    let query = args.next().unwrap_or_else(|| "the".to_string());
-
-    let mut hl = Headless::new()?;
-    let fonts = Fonts::bundled();
-    let palette = theme::DARK;
-    let ctx = RenderCtx { fonts: &fonts, theme: &palette };
-    let viewport = Rect::new(0.0, 0.0, width as f64, height as f64);
-
-    let mut scene = Scene::new();
-    // Plain dark UI background stand-in.
-    fill_rect(&mut scene, viewport, palette.base);
-    render(&mut scene, viewport, &query, &ctx);
-
-    let img = hl.render(&scene, width, height, palette.base)?;
-    img.save_png(&out)?;
-    eprintln!("wrote {out} ({width}x{height}, query={query:?})");
-    Ok(())
-}
 
 /// One representative palette command. Mirrors the fields lightjj's
 /// `PaletteCommand` actually renders (label + shortcut + submenu chevron).

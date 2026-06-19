@@ -39,8 +39,7 @@ fn run() -> Result<()> {
     use jjscratch::input;
     use jjscratch::model::jjlib;
     use jjscratch::text::Fonts;
-    use jjscratch::theme;
-    use jjscratch::ui::{self, RenderCtx, UiState};
+    use jjscratch::ui::{self, Frame, UiState};
     use jjscratch::Headless;
     use vello::kurbo::Affine;
     use vello::Scene;
@@ -83,11 +82,14 @@ fn run() -> Result<()> {
     eprintln!("loading real repo: {}", repo_path.display());
     let loaded = jjlib::open(&repo_path)?;
     let snapshot = jjlib::snapshot(&loaded)?;
+    // Load the op log once so an open Oplog drawer (the `4` key) shows real ops.
+    let oplog = jjlib::oplog(&loaded, 30).unwrap_or_default();
     eprintln!(
-        "loaded {} revisions from {} (workspace {})",
+        "loaded {} revisions from {} (workspace {}), {} ops",
         snapshot.revision_count(),
         snapshot.repo_name,
         snapshot.workspace_name,
+        oplog.len(),
     );
 
     // ---- seed cursor on the working copy (matching lightjj's default) ------
@@ -105,8 +107,6 @@ fn run() -> Result<()> {
         hl.adapter_info.name, hl.adapter_info.device_type, hl.adapter_info.backend
     );
     let fonts = Fonts::bundled();
-    let palette = theme::DARK;
-    let ctx = RenderCtx { fonts: &fonts, theme: &palette };
 
     // Render the CURRENT state to step-NN-<name>.png, computing the diff for the
     // selected commit so the diff panel follows the cursor.
@@ -118,6 +118,12 @@ fn run() -> Result<()> {
         let commit_id = &snapshot.nodes[state.selected].commit_id;
         let diff = jjlib::commit_diff(&loaded, commit_id)
             .with_context(|| format!("diffing selected commit {commit_id}"))?;
+        // Clear color follows the active theme (the `t` key flips it).
+        let clear = state.theme.palette().base;
+        let frame = Frame {
+            oplog: &oplog,
+            ..Default::default()
+        };
 
         let mut ui_scene = Scene::new();
         ui::build_scene(
@@ -125,18 +131,19 @@ fn run() -> Result<()> {
             &snapshot,
             Some(&diff),
             state,
-            &ctx,
+            &fonts,
+            &frame,
             width as f64,
             height as f64,
         );
 
         let (dev_w, dev_h) = (width * scale, height * scale);
         let img = if scale == 1 {
-            hl.render(&ui_scene, dev_w, dev_h, palette.base)?
+            hl.render(&ui_scene, dev_w, dev_h, clear)?
         } else {
             let mut scene = Scene::new();
             scene.append(&ui_scene, Some(Affine::scale(scale as f64)));
-            hl.render(&scene, dev_w, dev_h, palette.base)?
+            hl.render(&scene, dev_w, dev_h, clear)?
         };
         let out = format!("{out_dir}/step-{idx:02}-{name}.png");
         img.save_png(&out)?;

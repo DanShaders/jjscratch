@@ -1,5 +1,3 @@
-// INTEGRATION: move to src/ui/branches.rs; dispatch from ui::build_scene when active_view==View::Branches
-//
 //! BRANCHES / bookmarks view — lightjj's nav view "2" (BookmarksPanel.svelte).
 //!
 //! Renders the bookmark list that fills the right column in the Branches view:
@@ -8,10 +6,10 @@
 //! (short id + description + relative age). A key-footer mirrors the panel's
 //! keyboard affordances.
 //!
-//! This is a SELF-CONTAINED renderer built against the public `jjscratch::ui`
-//! paint helpers and the `model::{Snapshot, Bookmark, …}` contract, exactly
-//! like `ui/graph.rs` / `ui/diff.rs`. It paints only within its `rect` and
-//! clips to it.
+//! This is a SELF-CONTAINED renderer built against the `super` paint helpers
+//! and the `model::{Snapshot, Bookmark, …}` contract, exactly like
+//! `ui/graph.rs` / `ui/diff.rs`. It paints only within its `rect` and clips to
+//! it. `ui::build_scene` dispatches here when `active_view == View::Branches`.
 //!
 //! ## Sync state, sort order & data we can / can't render
 //!
@@ -36,27 +34,10 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Color, Fill};
 use vello::Scene;
 
-// This file is a bin-local MODULE (included by `preview_branches.rs` via
-// `#[path = "branches_view.rs"] mod branches_view;`), but `src/bin/*.rs` are
-// also auto-discovered as standalone binaries by Cargo. Provide a stub entry
-// point so the default `cargo build` (which compiles it as its own bin) stays
-// green; the real harness is `preview_branches`. When this file is `#[path]`-
-// included as a module, this `main` is just a module item (`branches_view::main`),
-// hence `#[allow(dead_code)]` to keep that path warning-clean.
-// INTEGRATION: deleted once this becomes `src/ui/branches.rs` (a library module,
-// not a `src/bin/` file, so no auto-bin and no stub needed).
-#[allow(dead_code)]
-fn main() {
-    eprintln!(
-        "branches_view is a renderer module; run the preview harness instead: \
-         `cargo run --features jjlib --bin preview_branches -- out.png 1280 800`"
-    );
-}
-
-use jjscratch::model::{Bookmark, BookmarkKind, CommitNode, Snapshot};
-use jjscratch::text;
-use jjscratch::theme::{self, font};
-use jjscratch::ui::{baseline_for, border_bottom, fill_rect, fill_round, stroke_round, RenderCtx};
+use crate::model::{Bookmark, BookmarkKind, CommitNode, Snapshot};
+use crate::text;
+use crate::theme::{self, font};
+use super::{baseline_for, border_bottom, fill_rect, fill_round, stroke_round, RenderCtx};
 
 // --- layout constants (calibrated to docs/reference/branches.png) -----------
 

@@ -13,17 +13,26 @@
 //! `--features jjlib` and given `JJSCRATCH_REPO=<path>`, loads a real repo.
 
 use anyhow::Result;
+use jjscratch::input;
 use jjscratch::model::{mock, CommitDiff, Snapshot};
 use jjscratch::text::Fonts;
-use jjscratch::theme;
-use jjscratch::ui::{self, RenderCtx, UiState};
+use jjscratch::ui::{self, Frame, UiState};
 use jjscratch::Headless;
 use vello::kurbo::Affine;
 use vello::Scene;
 
-/// Source the snapshot + working-copy diff from a real repo when
-/// `JJSCRATCH_REPO` is set and the `jjlib` feature is on; otherwise mock.
-fn load_data() -> Result<(Snapshot, Option<CommitDiff>)> {
+/// Everything the renderer needs from the data path: the snapshot, the
+/// working-copy diff, and (under `jjlib`) the operation log for the Oplog drawer.
+struct Data {
+    snapshot: Snapshot,
+    diff: Option<CommitDiff>,
+    #[cfg(feature = "jjlib")]
+    oplog: Vec<jjscratch::model::jjlib::OpEntry>,
+}
+
+/// Source data from a real repo when `JJSCRATCH_REPO` is set and the `jjlib`
+/// feature is on; otherwise mock.
+fn load_data() -> Result<Data> {
     #[cfg(feature = "jjlib")]
     {
         if let Some(path) = std::env::var_os("JJSCRATCH_REPO") {
@@ -36,16 +45,24 @@ fn load_data() -> Result<(Snapshot, Option<CommitDiff>)> {
                 Some(wc) => Some(jjlib::commit_diff(&loaded, &wc)?),
                 None => None,
             };
+            // Load the op log so an open Oplog drawer shows real operations.
+            let oplog = jjlib::oplog(&loaded, 30).unwrap_or_default();
             eprintln!(
-                "loaded {} revisions from {} (workspace {})",
+                "loaded {} revisions from {} (workspace {}), {} ops",
                 snapshot.revision_count(),
                 snapshot.repo_name,
                 snapshot.workspace_name,
+                oplog.len(),
             );
-            return Ok((snapshot, diff));
+            return Ok(Data { snapshot, diff, oplog });
         }
     }
-    Ok((mock::snapshot(), Some(mock::working_copy_diff())))
+    Ok(Data {
+        snapshot: mock::snapshot(),
+        diff: Some(mock::working_copy_diff()),
+        #[cfg(feature = "jjlib")]
+        oplog: Vec::new(),
+    })
 }
 
 fn main() -> Result<()> {
@@ -88,10 +105,9 @@ fn main() -> Result<()> {
         hl.adapter_info.name, hl.adapter_info.device_type, hl.adapter_info.backend
     );
 
-    let (snapshot, diff) = load_data()?;
+    let data = load_data()?;
+    let snapshot = &data.snapshot;
     let fonts = Fonts::bundled();
-    let palette = theme::DARK;
-    let ctx = RenderCtx { fonts: &fonts, theme: &palette };
     // Default the cursor to the working copy so the RevisionHeader/diff (which
     // currently shows the working-copy diff) and the selected row agree,
     // regardless of jj-lib's topological stream order.
@@ -102,27 +118,46 @@ fn main() -> Result<()> {
         .position(|n| n.is_working_copy)
         .unwrap_or(0);
 
+    // Optional state driver: `JJSCRATCH_KEYS="2"` / `"4"` / `"t"` / `"cmd+k"`
+    // (space-separated) applies keys through the real input router before the
+    // shot, so a single `shot` invocation can capture any UI state for review.
+    if let Ok(keys) = std::env::var("JJSCRATCH_KEYS") {
+        for k in keys.split_whitespace() {
+            input::handle_key(k, &mut state, snapshot);
+        }
+    }
+
+    // Clear color follows the active theme so the @Nx letterbox matches.
+    let clear = state.theme.palette().base;
+
+    let frame = Frame {
+        #[cfg(feature = "jjlib")]
+        oplog: &data.oplog,
+        ..Default::default()
+    };
+
     // Lay the UI out once at the logical size. At @1x it is rendered directly;
     // at @Nx it is appended into a fresh render scene under Affine::scale(N) so
     // every vector primitive (and glyph) is rasterised at device resolution.
     let mut ui_scene = Scene::new();
     ui::build_scene(
         &mut ui_scene,
-        &snapshot,
-        diff.as_ref(),
+        snapshot,
+        data.diff.as_ref(),
         &state,
-        &ctx,
+        &fonts,
+        &frame,
         width as f64,
         height as f64,
     );
 
     let (dev_w, dev_h) = (width * scale, height * scale);
     let img = if scale == 1 {
-        hl.render(&ui_scene, dev_w, dev_h, palette.base)?
+        hl.render(&ui_scene, dev_w, dev_h, clear)?
     } else {
         let mut scene = Scene::new();
         scene.append(&ui_scene, Some(Affine::scale(scale as f64)));
-        hl.render(&scene, dev_w, dev_h, palette.base)?
+        hl.render(&scene, dev_w, dev_h, clear)?
     };
     img.save_png(&out)?;
     eprintln!("wrote {out} ({dev_w}x{dev_h}, logical {width}x{height} @{scale}x)");

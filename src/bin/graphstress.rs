@@ -37,8 +37,7 @@ mod imp {
     use jjscratch::graph_layout::{self, Cell, GraphLayout};
     use jjscratch::model::{jjlib, EdgeType, Snapshot};
     use jjscratch::text::Fonts;
-    use jjscratch::theme;
-    use jjscratch::ui::{self, RenderCtx, UiState};
+    use jjscratch::ui::{self, UiState};
     use jjscratch::Headless;
     use vello::Scene;
 
@@ -403,14 +402,17 @@ mod imp {
         fonts: &Fonts,
         snapshot: &Snapshot,
     ) -> anyhow::Result<bool> {
-        let palette = theme::DARK;
-        let ctx = RenderCtx { fonts, theme: &palette };
         let mut state = UiState::default();
         state.selected = snapshot
             .nodes
             .iter()
             .position(|n| n.is_working_copy)
             .unwrap_or(0);
+        let clear = state.theme.palette().base;
+        let frame = ui::Frame {
+            oplog: &[],
+            ..Default::default()
+        };
 
         let (width, height) = (1280u32, 800u32);
         let mut ui_scene = Scene::new();
@@ -419,11 +421,12 @@ mod imp {
             snapshot,
             None,
             &state,
-            &ctx,
+            fonts,
+            &frame,
             width as f64,
             height as f64,
         );
-        let img = hl.render(&ui_scene, width, height, palette.base)?;
+        let img = hl.render(&ui_scene, width, height, clear)?;
 
         // Non-degenerate = more than one distinct RGBA pixel value.
         let first = &img.rgba[0..4];

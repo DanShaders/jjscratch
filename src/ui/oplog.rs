@@ -6,37 +6,23 @@
 //! lightjj's `.oplog-panel` / `.oplog-entry` (docs/spec/ui-spec.md §3, lightjj
 //! `frontend/src/lib/OplogPanel.svelte`).
 //!
-//! Self-contained for now: built and verified in isolation by `preview_oplog`.
 //! It paints ONLY within `rect` (clipped), the same contract the integrated
-//! `ui::{graph,diff}` renderers follow, so wiring it in later is mechanical.
-//
-// INTEGRATION: move to src/ui/oplog.rs; dispatch as a bottom drawer when the
-// Oplog toggle is active.
-
-// This file is compiled both as its own bin target and as a `#[path]` module of
-// `preview_oplog`. `#[allow(dead_code)]` keeps the shared helpers from warning
-// when compiled as the standalone bin (where `render` is the only public item).
+//! `ui::{graph,diff}` renderers follow. `ui::build_scene` dispatches here as a
+//! bottom drawer when `oplog_open` (the `4` toggle) is set.
 //
 // The renderer consumes `OpEntry`, which only exists under the `jjlib` feature,
-// so every item is gated on it. Without the feature the bin still compiles —
-// down to just the stub `main` below — keeping a featureless `cargo build`
-// green (Cargo.toml is owned elsewhere, so we can't add `required-features`).
-#![allow(dead_code)]
-
-/// Standalone-bin entry point WITHOUT the feature: the renderer is unavailable.
-#[cfg(not(feature = "jjlib"))]
-fn main() {
-    eprintln!("oplog_view needs --features jjlib (renders the op-log drawer).");
-}
+// so every item is gated on it. Without the feature the module is empty (the
+// `4` toggle in build_scene passes a mock/empty slice and skips the drawer),
+// keeping a featureless `cargo build` green.
 
 #[cfg(feature = "jjlib")]
-use jjscratch::model::jjlib::OpEntry;
+use crate::model::jjlib::OpEntry;
 #[cfg(feature = "jjlib")]
-use jjscratch::text;
+use crate::text;
 #[cfg(feature = "jjlib")]
-use jjscratch::theme::{font, layout as L};
+use crate::theme::{font, layout as L};
 #[cfg(feature = "jjlib")]
-use jjscratch::ui::{baseline_for, border_bottom, fill_rect, RenderCtx};
+use super::{baseline_for, border_bottom, fill_rect, RenderCtx};
 #[cfg(feature = "jjlib")]
 use vello::kurbo::{Affine, Rect};
 #[cfg(feature = "jjlib")]
@@ -55,9 +41,8 @@ use super::{baseline_for, border_bottom, fill_rect, font, text, Affine, Fill, Op
 /// Panel-header height (`.panel-header`, ui-spec §6 / §3) — same chrome the
 /// graph/diff headers use.
 const HEADER_H: f64 = L::PANEL_HEADER_H;
-/// `.oplog-entry`: `padding: 3px 12px` — one row is content + 2×3px.
-const ROW_PAD_Y: f64 = 3.0;
-/// `.oplog-entry` / `.panel-header` horizontal padding.
+/// `.oplog-entry` / `.panel-header` horizontal padding. (`.oplog-entry`'s
+/// `padding: 3px 12px` vertical 3px is folded into the fixed `ROW_H` below.)
 const PAD_X: f64 = 12.0;
 /// `.oplog-id` fixed column width (`width: 100px`).
 const ID_COL_W: f64 = 100.0;
@@ -196,7 +181,7 @@ fn nav_hint_kbd(scene: &mut Scene, x: f64, cy: f64, key: &str, ctx: &RenderCtx) 
     let kw = text::measure(&ctx.fonts.mono, sz, key) as f64;
     let pad = 3.0;
     let chip = Rect::new(x, cy - 7.0, x + kw + pad * 2.0, cy + 7.0);
-    jjscratch::ui::stroke_round(scene, chip, 3.0, t.surface1, 1.0);
+    crate::ui::stroke_round(scene, chip, 3.0, t.surface1, 1.0);
     text::draw_text(
         scene, &ctx.fonts.mono, sz, t.overlay0,
         x + pad, baseline_for(cy, sz, &ctx.fonts.mono), key,
@@ -214,17 +199,10 @@ fn draw_count_badge(scene: &mut Scene, header: Rect, n: usize, ctx: &RenderCtx) 
     let tw = text::measure(&ctx.fonts.ui_bold, bsz, &s) as f64;
     let bw = tw + 6.0 * 2.0;
     let pill = Rect::new(header.x1 - PAD_X - bw, cy - 8.0, header.x1 - PAD_X, cy + 8.0);
-    jjscratch::ui::fill_round(scene, pill, 8.0, t.surface0);
+    crate::ui::fill_round(scene, pill, 8.0, t.surface0);
     text::draw_text(
         scene, &ctx.fonts.ui_bold, bsz, t.subtext0,
         pill.x0 + 6.0, baseline_for(cy, bsz, &ctx.fonts.ui_bold), &s,
     );
 }
 } // mod imp
-
-/// Standalone-bin entry point WITH the feature. The real preview lives in
-/// `preview_oplog`; this only exists so `oplog_view` is a valid bin target.
-#[cfg(feature = "jjlib")]
-fn main() {
-    eprintln!("oplog_view is a renderer module; run `preview_oplog` to see it.");
-}
