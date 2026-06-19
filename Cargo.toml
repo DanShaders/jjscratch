@@ -23,6 +23,14 @@ anyhow = "1"
 # backend-agnostic; the reactive reload it drives is only wired under `jjlib`.
 notify = "8"
 
+# --- windowed (interactive) bin deps -------------------------------------
+# winit 0.30 (the ApplicationHandler API) drives the real on-screen window +
+# event loop for the `jjscratch` bin. Vello 0.9 already re-exports the wgpu
+# surface machinery (vello::util::{RenderContext, RenderSurface}), so no extra
+# wgpu dep is needed. winit's default features pull in x11 + wayland +
+# raw-window-handle 0.6 (rwh_06), which wgpu 29's surface creation requires.
+winit = "0.30"
+
 # Backend (opt-in via `jjlib` feature). Pinned to match the fixture's jj 0.42.
 jj-lib = { version = "0.42", optional = true }
 futures = { version = "0.3", optional = true }
@@ -30,6 +38,15 @@ futures = { version = "0.3", optional = true }
 [[bin]]
 name = "shot"
 path = "src/bin/shot.rs"
+
+# The interactive windowed app: a real winit window + Vello-on-wgpu surface
+# render loop with keyboard nav + live `.jj/` watch. Needs the jj-lib backend to
+# load a real repo, so it is gated on the `jjlib` feature (build with
+# `cargo build --bin jjscratch --features jjlib`).
+[[bin]]
+name = "jjscratch"
+path = "src/bin/jjscratch.rs"
+required-features = ["jjlib"]
 
 # Watch demo: tails a repo's `.jj/` and reloads on each change (jjlib-only).
 [[bin]]
