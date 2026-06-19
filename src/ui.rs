@@ -13,7 +13,7 @@ pub mod graph;
 pub mod oplog;
 pub mod palette;
 
-use vello::kurbo::{Affine, BezPath, Cap, Join, Line, Rect, Stroke};
+use vello::kurbo::{Affine, BezPath, Cap, Join, Line, Point, Rect, Stroke};
 use vello::peniko::{Color, Fill};
 use vello::Scene;
 
@@ -61,6 +61,24 @@ const PRESET_CHIPS_PAD_BOTTOM: f64 = 6.0;
 const PRESET_CHIP_PAD_X: f64 = 8.0;
 /// Gap between preset chips (`.preset-chips` gap:4).
 const PRESET_CHIP_GAP: f64 = 4.0;
+
+// --- diff-panel sub-band heights (mirror ui/diff.rs) -------------------------
+//
+// The diff panel stacks a RevisionHeader, a FILES bar (with file tabs), then a
+// diff toolbar before the scrolling file blocks. `diff.rs` owns the drawing but
+// `hit_test` needs the same band heights to map a click in the diff column to a
+// FileTab vs. the diff body. These mirror the `h` locals in diff.rs's
+// `revision_header` / `files_bar` (kept in sync by value; diff.rs is owned by
+// another agent so we cannot share a const directly).
+/// RevisionHeader band height (diff.rs `revision_header` `h = 41.0`).
+pub const DIFF_REV_HEADER_H: f64 = 41.0;
+/// FILES bar (file-tabs strip) band height (diff.rs `files_bar` `h = 38.0`).
+pub const DIFF_FILES_BAR_H: f64 = 38.0;
+
+/// Top padding of the graph row list below the panel header (mirrors
+/// `ui/graph.rs`'s `LIST_TOP_PAD`). Needed by [`revision_at_y`] so a click maps
+/// to the same flattened sub-row the graph renderer paints.
+pub const GRAPH_LIST_TOP_PAD: f64 = 2.0;
 
 /// Which top-level view fills the right column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +255,322 @@ impl FrameLayout {
             statusbar,
         }
     }
+}
+
+// --- graph row flattening (shared with ui/graph.rs) -------------------------
+
+/// Number of flattened 18px sub-rows a single revision expands into in the
+/// graph, mirroring `ui/graph.rs`'s flatten loop: a node line, an optional
+/// bookmark line, a meta line, and an optional `(elided revisions)` marker row
+/// (when the revision's first non-missing parent edge is `Indirect`).
+///
+/// Kept here (not in the agent-owned `graph.rs`) so both the renderer's row
+/// count and `hit_test`'s click→revision mapping derive from ONE definition.
+fn sub_rows_for(n: &crate::model::CommitNode) -> usize {
+    use crate::model::EdgeType;
+    let mut rows = 1; // node line
+    if !n.bookmarks.is_empty() {
+        rows += 1; // bookmark line
+    }
+    rows += 1; // meta line
+    let elided = n
+        .parents
+        .iter()
+        .find(|p| p.edge_type != EdgeType::Missing)
+        .map(|p| p.edge_type == EdgeType::Indirect)
+        .unwrap_or(false);
+    if elided {
+        rows += 1; // (elided revisions) marker
+    }
+    rows
+}
+
+/// Map a y coordinate (in the graph content rect's space) to the revision index
+/// under it, accounting for the list top-pad and the current `graph_scroll`.
+/// Returns `None` when `y` is above the first row or below the last flattened
+/// sub-row. This mirrors `ui/graph.rs`'s flatten + `y += ROW_H` walk exactly, so
+/// a click lands on the same revision group the renderer highlights (clicking
+/// ANY of a revision's sub-rows — node/bookmark/meta/elided — selects it, as in
+/// lightjj where every `.graph-row` carries the same `data-entry`).
+pub fn revision_at_y(
+    graph_content: Rect,
+    snapshot: &Snapshot,
+    graph_scroll: f64,
+    y: f64,
+) -> Option<usize> {
+    // Row top of the first flattened sub-row (graph.rs: rect.y0 + LIST_TOP_PAD
+    // - graph_scroll). `rel` is the offset of `y` into the (unscrolled) list.
+    let list_top = graph_content.y0 + GRAPH_LIST_TOP_PAD - graph_scroll;
+    let rel = y - list_top;
+    if rel < 0.0 {
+        return None;
+    }
+    let target_row = (rel / L::ROW_H).floor() as usize;
+    let mut row = 0usize;
+    for (i, n) in snapshot.nodes.iter().enumerate() {
+        let span = sub_rows_for(n);
+        if target_row < row + span {
+            return Some(i);
+        }
+        row += span;
+    }
+    None
+}
+
+// --- hit-testing ------------------------------------------------------------
+
+/// A clickable/scrollable region of the frame, resolved from a cursor position.
+/// The window agent turns winit pointer events into coordinates, calls
+/// [`hit_test`], and (for clicks/wheels) routes through `input::handle_mouse`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitTarget {
+    /// A toolbar nav tab (the `.seg` segmented control) → switches `active_view`.
+    NavTab(View),
+    /// A toolbar drawer toggle (Oplog/Evolog), mirroring keys `4`/`5`.
+    DrawerToggle(Drawer),
+    /// The toolbar `Search…` button (opens the command palette).
+    SearchButton,
+    /// The far-right theme toggle glyph (☀), mirroring key `t`.
+    ThemeToggle,
+    /// A revision row in the graph list (the revision *index*, not sub-row).
+    RevisionRow(usize),
+    /// A preset chip in the revset-filter chip band (chip index).
+    PresetChip(usize),
+    /// A file tab in the diff FILES bar (tab index; band-level today).
+    FileTab(usize),
+    /// The draggable panel divider between the graph and the right column.
+    Divider,
+    /// The graph content area (scroll/empty space below the rows).
+    GraphArea,
+    /// The diff content area (right column body, below the file-tabs strip).
+    DiffArea,
+    /// The bottom status bar.
+    Statusbar,
+    /// Nothing interactive under the cursor.
+    None,
+}
+
+/// Which bottom drawer a [`HitTarget::DrawerToggle`] refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawer {
+    Oplog,
+    Evolog,
+}
+
+/// Horizontal spans (x0, x1) of the toolbar's interactive clusters, computed by
+/// replaying `draw_toolbar`'s metrics. `hit_test` uses these so a toolbar click
+/// lands on the SAME pill the renderer drew. Computed with `fonts` because the
+/// pill widths depend on measured label/kbd text (Inter/JetBrains advances).
+struct ToolbarRegions {
+    /// (x0, x1, view) per nav-tab `.seg-btn`.
+    tabs: [(f64, f64, View); 3],
+    /// (x0, x1) of the Oplog drawer toggle.
+    oplog: (f64, f64),
+    /// (x0, x1) of the Evolog drawer toggle.
+    evolog: (f64, f64),
+    /// (x0, x1) of the `Search…` button.
+    search: (f64, f64),
+    /// (x0, x1) of the far-right theme toggle glyph.
+    theme: (f64, f64),
+}
+
+impl ToolbarRegions {
+    /// Replay `draw_toolbar`'s x-advance to recover each cluster's span. Mirrors
+    /// the metric helpers (`seg_control`/`nav_btn`/`search_button`) by value;
+    /// any change to those must be reflected here (both live in this file).
+    fn compute(bar: Rect, state: &UiState, workspace_name: &str, fonts: &Fonts) -> Self {
+        let sz = theme::font::FS_SM;
+        let mut x = TOOLBAR_PAD_X;
+
+        // 1. logo (16px) + gap.
+        x += 16.0 + TOOLBAR_GAP;
+        // 2. divider (1px) + gap.
+        x += 1.0 + TOOLBAR_GAP;
+        // 3. workspace pill + gap.
+        {
+            let glyph = "\u{25c7}";
+            let gw = text::measure(&fonts.mono, theme::font::FS_XS, glyph) as f64;
+            let nw = text::measure(&fonts.mono, sz, workspace_name) as f64;
+            let inner = gw + 6.0 + nw;
+            let w = NAV_BTN_PAD_X + inner + NAV_BTN_PAD_X;
+            x += w + TOOLBAR_GAP;
+        }
+
+        // 4. nav-tab seg control: outer box from `x`, three buttons.
+        let tabs_spec = [
+            ("\u{25c9}", "Revisions", "1", View::Revisions),
+            ("\u{2442}", "Branches", "2", View::Branches),
+            ("\u{29c9}", "Merge", "3", View::Merge),
+        ];
+        let btn_w = |icon: &str, word: &str, key: &str, bold: bool| -> f64 {
+            let lw = icon_label_w_fonts(icon, word, sz, bold, fonts);
+            let kw = text::measure(&fonts.mono, theme::font::FS_2XS, key) as f64;
+            BTN_PAD_X + lw + KBD_GAP + (kw + 6.0) + BTN_PAD_X
+        };
+        let mut tabs = [
+            (0.0, 0.0, View::Revisions),
+            (0.0, 0.0, View::Branches),
+            (0.0, 0.0, View::Merge),
+        ];
+        let mut bx = x;
+        for (i, (icon, word, key, view)) in tabs_spec.iter().enumerate() {
+            let active = state.active_view == *view;
+            let w = btn_w(icon, word, key, active);
+            tabs[i] = (bx, bx + w, *view);
+            bx += w;
+        }
+        x = bx + TOOLBAR_GAP;
+
+        // 5. divider + gap.
+        x += 1.0 + TOOLBAR_GAP;
+
+        // 6. drawer toggles (`nav_btn`): pad + icon-label + kbd + pad, then it
+        // adds NAV_BTN_PAD_X + TOOLBAR_GAP to the returned x.
+        let nav_btn_span = |icon: &str, word: &str, key: &str| -> f64 {
+            let lw = icon_label_w_fonts(icon, word, sz, false, fonts);
+            let kw = text::measure(&fonts.mono, theme::font::FS_2XS, key) as f64;
+            // lx=x+pad; label; +KBD_GAP; kbd chip (kw + 2*3 pad); then nav_btn
+            // returns kend + NAV_BTN_PAD_X (+ TOOLBAR_GAP). The visible pill ends
+            // at kend + NAV_BTN_PAD_X.
+            NAV_BTN_PAD_X + lw + KBD_GAP + (kw + 6.0) + NAV_BTN_PAD_X
+        };
+        let oplog_w = nav_btn_span("\u{27f2}", "Oplog", "4");
+        let oplog = (x, x + oplog_w);
+        x = oplog.1 + TOOLBAR_GAP;
+        let evolog_w = nav_btn_span("\u{25d0}", "Evolog", "5");
+        let evolog = (x, x + evolog_w);
+        x = evolog.1 + TOOLBAR_GAP;
+
+        // 7. divider: draw_toolbar inserts it at `x + (TOOLBAR_GAP - 4.0)`.
+        x += (TOOLBAR_GAP - 4.0) + 1.0 + TOOLBAR_GAP;
+
+        // 8. search button (`search_button`): pad + label + 8 + kbd(kw+8) + pad.
+        let search = {
+            let label = "Search\u{2026}";
+            let key = "Ctrl+K";
+            let lw = text::measure(&fonts.ui, sz, label) as f64;
+            let kw = text::measure(&fonts.mono, theme::font::FS_2XS, key) as f64;
+            let kbd_w = kw + 4.0 * 2.0;
+            let inner = lw + 8.0 + kbd_w;
+            let w = NAV_BTN_PAD_X + inner + NAV_BTN_PAD_X;
+            (x, x + w)
+        };
+
+        // Right group: the ☀ theme-toggle glyph, right-anchored.
+        let sun = "\u{2600}";
+        let tw = text::measure(&fonts.ui, theme::font::BASE, sun) as f64;
+        let theme_x1 = bar.x1 - TOOLBAR_PAD_X - 6.0;
+        let theme = (theme_x1 - tw, theme_x1);
+
+        Self { tabs, oplog, evolog, search, theme }
+    }
+}
+
+/// Resolve the [`HitTarget`] under a cursor at logical `(x, y)`.
+///
+/// `fonts` is required because the toolbar pill widths depend on measured text
+/// (the same advances the renderer uses), so a toolbar click resolves to the
+/// exact pill drawn. `snapshot` + `state.graph_scroll` drive the graph row math.
+pub fn hit_test(
+    x: f64,
+    y: f64,
+    layout: &FrameLayout,
+    snapshot: &Snapshot,
+    state: &UiState,
+    fonts: &Fonts,
+) -> HitTarget {
+    let p = Point::new(x, y);
+
+    // Toolbar clusters (top band).
+    if layout.toolbar.contains(p) {
+        let tr = ToolbarRegions::compute(layout.toolbar, state, &snapshot.workspace_name, fonts);
+        for (x0, x1, view) in tr.tabs {
+            if x >= x0 && x < x1 {
+                return HitTarget::NavTab(view);
+            }
+        }
+        if x >= tr.oplog.0 && x < tr.oplog.1 {
+            return HitTarget::DrawerToggle(Drawer::Oplog);
+        }
+        if x >= tr.evolog.0 && x < tr.evolog.1 {
+            return HitTarget::DrawerToggle(Drawer::Evolog);
+        }
+        if x >= tr.search.0 && x < tr.search.1 {
+            return HitTarget::SearchButton;
+        }
+        if x >= tr.theme.0 && x < tr.theme.1 {
+            return HitTarget::ThemeToggle;
+        }
+        return HitTarget::None;
+    }
+
+    if layout.statusbar.contains(p) {
+        return HitTarget::Statusbar;
+    }
+
+    // Divider takes priority over the adjacent content areas (it's a thin strip
+    // between them; a click anywhere on it should start a drag).
+    if layout.divider.contains(p) {
+        return HitTarget::Divider;
+    }
+
+    // Preset-chips band (left column).
+    if layout.preset_chips.contains(p) {
+        if let Some(i) = preset_chip_at(layout.preset_chips, x, fonts) {
+            return HitTarget::PresetChip(i);
+        }
+        return HitTarget::None;
+    }
+
+    // Graph list.
+    if layout.graph_content.contains(p) {
+        if let Some(i) = revision_at_y(layout.graph_content, snapshot, state.graph_scroll, y) {
+            return HitTarget::RevisionRow(i);
+        }
+        return HitTarget::GraphArea;
+    }
+
+    // Right column. In the Revisions view, the top of the column is the diff
+    // panel: a RevisionHeader band, then the FILES bar (file tabs), then body.
+    if layout.diff_content.contains(p) {
+        if state.active_view == View::Revisions {
+            let files_y0 = layout.diff_content.y0 + DIFF_REV_HEADER_H;
+            let files_y1 = files_y0 + DIFF_FILES_BAR_H;
+            if y >= files_y0 && y < files_y1 {
+                // Band-level: the per-tab x advances depend on diff data we map
+                // coarsely. The model has no selected-file slot, so this is an
+                // outcome-only hit; report the first tab.
+                return HitTarget::FileTab(0);
+            }
+        }
+        return HitTarget::DiffArea;
+    }
+
+    HitTarget::None
+}
+
+/// Index of the preset chip under `x` in the chip band, mirroring
+/// `draw_preset_chips`'s x-advance. Returns `None` between/around chips.
+fn preset_chip_at(band: Rect, x: f64, fonts: &Fonts) -> Option<usize> {
+    let sz = theme::font::FS_SM;
+    let presets = ["WIP", "My work", "Default", "All", "Conflicts", "Divergent"];
+    let mut cx = band.x0 + REVSET_PAD_X;
+    for (i, label) in presets.iter().enumerate() {
+        let lw = text::measure(&fonts.ui, sz, label) as f64;
+        let w = PRESET_CHIP_PAD_X + lw + PRESET_CHIP_PAD_X;
+        if x >= cx && x < cx + w {
+            return Some(i);
+        }
+        cx += w + PRESET_CHIP_GAP;
+    }
+    None
+}
+
+/// Width of an `icon word` run, fonts-only variant for hit-testing (mirrors
+/// [`icon_label_w`] but takes `&Fonts` instead of `&RenderCtx`).
+fn icon_label_w_fonts(icon: &str, word: &str, sz: f32, bold: bool, fonts: &Fonts) -> f64 {
+    let font = if bold { &fonts.ui_bold } else { &fonts.ui };
+    text::measure(font, sz, icon) as f64 + ICON_LABEL_GAP + text::measure(font, sz, word) as f64
 }
 
 /// Build the full-window scene. `width`/`height` are logical px.
@@ -950,4 +1284,159 @@ pub fn baseline(cy: f64, size: f32) -> f64 {
 pub fn baseline_for(cy: f64, size: f32, font: &vello::peniko::FontData) -> f64 {
     let m = text::line_metrics(font, size);
     cy + (m.ascent - m.descent.abs()) as f64 / 2.0
+}
+
+
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+    use crate::model::mock;
+    use crate::text::Fonts;
+
+    const TW: f64 = 1280.0;
+    const TH: f64 = 800.0;
+
+    fn setup() -> (Fonts, Snapshot, UiState, FrameLayout) {
+        let fonts = Fonts::bundled();
+        let snap = mock::snapshot();
+        let st = UiState::default();
+        let fl = FrameLayout::compute(TW, TH, st.panel_width, st.active_view, false);
+        (fonts, snap, st, fl)
+    }
+
+    #[test]
+    fn toolbar_nav_tabs_map_to_views() {
+        let (fonts, snap, st, fl) = setup();
+        let cy = fl.toolbar.center().y;
+        // The three `.seg-btn`s sit left→right: Revisions, Branches, Merge.
+        assert_eq!(
+            hit_test(150.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::NavTab(View::Revisions),
+        );
+        assert_eq!(
+            hit_test(260.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::NavTab(View::Branches),
+        );
+        assert_eq!(
+            hit_test(360.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::NavTab(View::Merge),
+        );
+    }
+
+    #[test]
+    fn toolbar_drawer_search_theme_targets() {
+        let (fonts, snap, st, fl) = setup();
+        let cy = fl.toolbar.center().y;
+        assert_eq!(
+            hit_test(470.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::DrawerToggle(Drawer::Oplog),
+        );
+        assert_eq!(
+            hit_test(560.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::DrawerToggle(Drawer::Evolog),
+        );
+        assert_eq!(
+            hit_test(680.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::SearchButton,
+        );
+        // Theme glyph is far-right (just inside the 16px right inset).
+        assert_eq!(
+            hit_test(TW - 20.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::ThemeToggle,
+        );
+    }
+
+    #[test]
+    fn divider_strip_is_hit() {
+        let (fonts, snap, st, fl) = setup();
+        let dx = (fl.divider.x0 + fl.divider.x1) / 2.0;
+        let dy = fl.divider.center().y;
+        assert_eq!(hit_test(dx, dy, &fl, &snap, &st, &fonts), HitTarget::Divider);
+    }
+
+    #[test]
+    fn graph_rows_map_to_revisions() {
+        let (fonts, snap, st, fl) = setup();
+        let x = fl.graph_content.x0 + 100.0;
+        // First flattened sub-row is revision 0; clicking the node row of a later
+        // revision returns its index (any sub-row maps to the revision group).
+        let y0 = fl.graph_content.y0 + GRAPH_LIST_TOP_PAD + L::ROW_H * 0.5;
+        assert_eq!(
+            hit_test(x, y0, &fl, &snap, &st, &fonts),
+            HitTarget::RevisionRow(0),
+        );
+        // Walk the flatten to find revision 2's first row and assert it maps to 2.
+        let mut row = 0usize;
+        for (i, n) in snap.nodes.iter().enumerate() {
+            if i == 2 {
+                let y = fl.graph_content.y0 + GRAPH_LIST_TOP_PAD + row as f64 * L::ROW_H + 1.0;
+                assert_eq!(
+                    hit_test(x, y, &fl, &snap, &st, &fonts),
+                    HitTarget::RevisionRow(2),
+                );
+                break;
+            }
+            row += sub_rows_for(n);
+        }
+    }
+
+    #[test]
+    fn empty_space_below_rows_is_graph_area() {
+        let (fonts, snap, st, fl) = setup();
+        let x = fl.graph_content.x0 + 100.0;
+        // Far below the last row → GraphArea, not a RevisionRow.
+        let y = fl.graph_content.y1 - 2.0;
+        assert_eq!(hit_test(x, y, &fl, &snap, &st, &fonts), HitTarget::GraphArea);
+    }
+
+    #[test]
+    fn preset_chips_map_by_index() {
+        let (fonts, snap, st, fl) = setup();
+        let cy = fl.preset_chips.center().y;
+        // First chip ("WIP") sits at the band's left padding.
+        assert_eq!(
+            hit_test(fl.preset_chips.x0 + REVSET_PAD_X + 2.0, cy, &fl, &snap, &st, &fonts),
+            HitTarget::PresetChip(0),
+        );
+    }
+
+    #[test]
+    fn statusbar_and_diff_area() {
+        let (fonts, snap, st, fl) = setup();
+        assert_eq!(
+            hit_test(100.0, fl.statusbar.center().y, &fl, &snap, &st, &fonts),
+            HitTarget::Statusbar,
+        );
+        // A point in the diff body (well below the file-tabs strip).
+        assert_eq!(
+            hit_test(fl.diff_content.x0 + 200.0, fl.diff_content.y0 + 200.0, &fl, &snap, &st, &fonts),
+            HitTarget::DiffArea,
+        );
+    }
+
+    #[test]
+    fn file_tab_band_in_revisions_view() {
+        let (fonts, snap, st, fl) = setup();
+        // The FILES strip sits below the 41px RevisionHeader.
+        let y = fl.diff_content.y0 + DIFF_REV_HEADER_H + DIFF_FILES_BAR_H / 2.0;
+        assert_eq!(
+            hit_test(fl.diff_content.x0 + 200.0, y, &fl, &snap, &st, &fonts),
+            HitTarget::FileTab(0),
+        );
+    }
+
+    #[test]
+    fn revision_at_y_accounts_for_scroll() {
+        let (_fonts, snap, _st, fl) = setup();
+        let y0 = fl.graph_content.y0 + GRAPH_LIST_TOP_PAD + 1.0;
+        // No scroll: top of the list is revision 0.
+        assert_eq!(revision_at_y(fl.graph_content, &snap, 0.0, y0), Some(0));
+        // Above the list → None.
+        assert_eq!(revision_at_y(fl.graph_content, &snap, 0.0, fl.graph_content.y0 - 5.0), None);
+        // Scrolling by one revision's worth of rows shifts what's at the top: the
+        // same y now lands on a later revision (scroll moves content up).
+        let span0 = sub_rows_for(&snap.nodes[0]) as f64 * L::ROW_H;
+        assert_eq!(revision_at_y(fl.graph_content, &snap, span0, y0), Some(1));
+    }
 }
