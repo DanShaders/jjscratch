@@ -175,7 +175,7 @@ pub const LIGHT: Palette = Palette {
     syn_punct: rgb(0x9c, 0xa0, 0xb0),
     syn_atom: rgb(0xfe, 0x64, 0x0b),
     bg_hover: rgb(0xef, 0xef, 0xed), // = surface0
-    bg_selected: rgb(0xf7, 0xef, 0xe2), // amber 8% over base
+    bg_selected: rgb(0xf7, 0xf4, 0xec), // amber 4% over base (graph-row .selected, RevisionGraph.svelte)
     bg_checked: rgb(0xe8, 0xee, 0xe6), // green 8% over base
     bg_checked_selected: rgb(0xe0, 0xe9, 0xde), // green 12% over base
     bg_active: rgb(0xf5, 0xe9, 0xd4), // active seg-btn (amber 14% over base)
