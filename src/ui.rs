@@ -194,8 +194,9 @@ pub struct FrameLayout {
 }
 
 /// Height of an open bottom drawer (Oplog/Evolog). lightjj's `.oplog-panel`
-/// floats above the statusbar; ~38% of an 800px frame reads like the reference.
-const DRAWER_H: f64 = 300.0;
+/// floats above the statusbar with a `max-height` of 200 logical px (measured
+/// against the reference drawer band), so the drawer top lands there.
+const DRAWER_H: f64 = 200.0;
 
 impl FrameLayout {
     pub fn compute(w: f64, h: f64, panel_w: f64, view: View, drawer_open: bool) -> Self {
@@ -899,7 +900,12 @@ fn draw_preset_chips(scene: &mut Scene, fl: &FrameLayout, ctx: &RenderCtx) {
         let w = PRESET_CHIP_PAD_X + lw + PRESET_CHIP_PAD_X;
         let chip = Rect::new(x, cy - chip_h / 2.0, x + w, cy + chip_h / 2.0);
         let active = i == 0;
-        fill_round(scene, chip, 3.0, t.surface0);
+        // lightjj `.preset-chip` has a TRANSPARENT background + transparent
+        // border when inactive (it only fills on `:hover`, which we don't
+        // model); in the reference the inactive chips show no pill at all — just
+        // --subtext0 text on the bar. The active chip gets the amber border +
+        // amber text (still no fill). Filling inactive chips with --surface0
+        // (visible over --mantle, esp. in the light theme) was the mismatch.
         let color = if active {
             stroke_round(scene, chip, 3.0, t.amber, 1.0);
             t.amber
