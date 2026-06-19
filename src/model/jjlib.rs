@@ -358,6 +358,128 @@ pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
     })
 }
 
+// --- Operation log --------------------------------------------------------
+
+/// One entry of the operation log (jj's "undo history"). A render-ready,
+/// jj-lib-free value type — the same boundary discipline the rest of this module
+/// keeps. Mirrors lightjj's `OpEntry` (id / description / time), plus a small
+/// `tags` vector for badges (e.g. the current head, snapshot ops).
+#[derive(Clone, Debug)]
+pub struct OpEntry {
+    /// Short operation id (hex prefix), as jj's `op log` shows it.
+    pub id: String,
+    /// Human description of the operation (jj records the command line here,
+    /// e.g. `describe -m ...`, `snapshot working copy`).
+    pub description: String,
+    /// Short, mostly-relative age string (e.g. `now`, `5m`, `3h`, `2d`).
+    pub time: String,
+    /// Badges: `"current"` for the head operation, `"snapshot"` for pure
+    /// working-copy snapshots.
+    pub tags: Vec<String>,
+}
+
+/// Read up to `limit` entries of the repository's operation log, newest first.
+///
+/// # jj-lib API
+///
+/// * The head operation is `repo.operation()` (a [`jj_lib::operation::Operation`]
+///   that bundles the op-store handle + id + data).
+/// * [`op_walk::walk_ancestors`] streams that head and its ancestors in reverse
+///   topological order (newest → oldest), lazily reading each parent via
+///   `Operation::parents()`. We take the first `limit`.
+/// * Per operation we read `op.id().hex()` (shortened for display) and
+///   `op.metadata()` — an [`jj_lib::op_store::OperationMetadata`] carrying
+///   `description`, `time` (a `TimestampRange`), and `is_snapshot`.
+///
+/// Strictly read-only: we never undo or restore. The op-store walk is async, so
+/// (like the rest of this module) we drive it with `pollster::block_on`.
+pub fn oplog(loaded: &Loaded, limit: usize) -> anyhow::Result<Vec<OpEntry>> {
+    use jj_lib::op_walk;
+
+    let head = loaded.repo.operation().clone();
+    let head_id = head.id().clone();
+
+    // Wall-clock "now" in epoch-ms, for relative-age formatting.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let entries = pollster::block_on(async {
+        let mut stream = std::pin::pin!(op_walk::walk_ancestors(std::slice::from_ref(&head)));
+        let mut out: Vec<OpEntry> = Vec::new();
+        while out.len() < limit {
+            let Some(op) = stream.next().await else { break };
+            let op = op.map_err(|e| anyhow!("walking op log: {e}"))?;
+
+            let id = op.id();
+            let full = id.hex();
+            // jj shows operation ids as a short hex prefix; 12 chars matches its
+            // default `op log` display width.
+            let short: String = full.chars().take(12).collect();
+
+            let meta = op.metadata();
+            // The op's end time is when it finished — what jj's `op log` shows.
+            let end_ms = meta.time.end.timestamp.0;
+            let time = relative_age(now_ms, end_ms);
+
+            let mut tags = Vec::new();
+            if id == &head_id {
+                tags.push("current".to_string());
+            }
+            if meta.is_snapshot {
+                tags.push("snapshot".to_string());
+            }
+
+            // jj records the command line (or a synthetic label) here; take the
+            // first line so multi-line descriptions stay one row.
+            let description = meta
+                .description
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            out.push(OpEntry {
+                id: short,
+                description,
+                time,
+                tags,
+            });
+        }
+        Ok::<_, anyhow::Error>(out)
+    })?;
+
+    Ok(entries)
+}
+
+/// Compact relative-age string (`now`, `5m`, `3h`, `2d`, `4mo`, `2y`), mirroring
+/// lightjj's `relativeTime`. `now_ms`/`then_ms` are epoch-milliseconds.
+fn relative_age(now_ms: i64, then_ms: i64) -> String {
+    let secs = (now_ms - then_ms).max(0) / 1000;
+    if secs < 60 {
+        return "now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hrs = mins / 60;
+    if hrs < 24 {
+        return format!("{hrs}h");
+    }
+    let days = hrs / 24;
+    if days < 30 {
+        return format!("{days}d");
+    }
+    let months = days / 30;
+    if months < 12 {
+        return format!("{months}mo");
+    }
+    format!("{}y", days / 365)
+}
+
 fn map_edge(kind: GraphEdgeType) -> EdgeType {
     match kind {
         GraphEdgeType::Direct => EdgeType::Direct,
@@ -802,6 +924,42 @@ mod tests {
             .last()
             .expect("at least one node");
         assert!(root.is_immutable, "root should be immutable");
+    }
+
+    #[test]
+    fn reads_oplog() {
+        let loaded = open(&fixture_path()).expect("open fixture");
+        let ops = oplog(&loaded, 30).expect("oplog");
+
+        // The fixture was built by a sequence of jj commands, so its op log has
+        // many entries. The head op is current; every entry has a non-empty id
+        // and a relative-age time string.
+        assert!(!ops.is_empty(), "fixture op log should be non-empty");
+        assert!(
+            ops.iter().any(|o| o.tags.iter().any(|t| t == "current")),
+            "exactly the head op should be tagged current"
+        );
+        let current_count = ops
+            .iter()
+            .filter(|o| o.tags.iter().any(|t| t == "current"))
+            .count();
+        assert_eq!(current_count, 1, "only one op should be the current head");
+
+        for op in &ops {
+            assert!(!op.id.is_empty(), "op id should be a non-empty hex prefix");
+            assert!(!op.time.is_empty(), "op time should be formatted");
+            assert!(op.id.chars().all(|c| c.is_ascii_hexdigit()), "id is hex");
+        }
+
+        // The very first entry is the head (newest), which carries `current`.
+        assert!(
+            ops[0].tags.iter().any(|t| t == "current"),
+            "first entry should be the current head op"
+        );
+
+        // The `limit` is respected.
+        let two = oplog(&loaded, 2).expect("oplog limited");
+        assert!(two.len() <= 2, "limit should cap the entry count");
     }
 
     #[test]
