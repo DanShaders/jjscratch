@@ -89,11 +89,19 @@ fn state_for(keys: &str, snapshot: &Snapshot) -> UiState {
 }
 
 /// Render one integrated state to an RGBA image, exactly mirroring `shot.rs`'s
-/// in-process path at @1x with the mock fixture as the data source.
-fn render_integrated(hl: &mut Headless, fonts: &Fonts, keys: &str) -> Image {
+/// in-process path at @1x with the mock fixture as the data source. `mutate`
+/// lets a state tweak the driven `UiState` further (e.g. set `hovered`) so the
+/// suite can guard mouse-driven render states the key driver can't express.
+fn render_integrated_with(
+    hl: &mut Headless,
+    fonts: &Fonts,
+    keys: &str,
+    mutate: impl FnOnce(&mut UiState, &Snapshot),
+) -> Image {
     let snapshot: Snapshot = mock::snapshot();
     let diff: CommitDiff = mock::working_copy_diff();
-    let state = state_for(keys, &snapshot);
+    let mut state = state_for(keys, &snapshot);
+    mutate(&mut state, &snapshot);
     let clear = state.theme.palette().base;
 
     let frame = Frame::default();
@@ -110,6 +118,11 @@ fn render_integrated(hl: &mut Headless, fonts: &Fonts, keys: &str) -> Image {
     );
     hl.render(&ui_scene, W, H, clear)
         .expect("vello render failed")
+}
+
+/// The common case: render a key-driven state with no extra mutation.
+fn render_integrated(hl: &mut Headless, fonts: &Fonts, keys: &str) -> Image {
+    render_integrated_with(hl, fonts, keys, |_, _| {})
 }
 
 // --------------------------------------------------------------------------
@@ -259,6 +272,12 @@ fn dump_failure(state: &str, actual: &Image, golden: &Image) {
 enum Source {
     /// Integrated state via `build_scene`, driven by replayed key tokens.
     Keys(&'static str),
+    /// Integrated state driven by key tokens, then with `hovered` set to a fixed
+    /// revision index — guards the mouse-hover row highlight (`handle_mouse`'s
+    /// `Move` over a graph row sets `UiState::hovered`, which `build_scene`
+    /// paints as a `bg_hover` row fill). The key driver can't express hover, so
+    /// this state sets it directly, the way `handle_mouse` would.
+    Hover { keys: &'static str, index: usize },
     /// Bin-local preview view, captured by shelling out to a `preview_*` bin.
     Preview(&'static str),
 }
@@ -295,6 +314,10 @@ fn states() -> Vec<(String, Source)> {
         (feature_suffixed("oplog"), Source::Keys("4")),
         ("light".into(), Source::Keys("t")),     // light theme
         ("palette".into(), Source::Keys("ctrl+k")), // command palette overlay
+        // Mouse hover: revision 2 hovered (not selected) shows the bg_hover row
+        // highlight that `handle_mouse`'s `Move` produces. Selection stays on the
+        // working copy so hover and selection are visibly distinct rows.
+        ("hover".into(), Source::Hover { keys: "", index: 2 }),
         // Isolated preview views (subprocess — bin-local renderers).
         ("preview_merge".into(), Source::Preview("preview_merge")),
         ("preview_evolog".into(), Source::Preview("preview_evolog")),
@@ -305,6 +328,12 @@ fn states() -> Vec<(String, Source)> {
 fn render_state(hl: &mut Headless, fonts: &Fonts, src: &Source) -> Image {
     match src {
         Source::Keys(keys) => render_integrated(hl, fonts, keys),
+        Source::Hover { keys, index } => {
+            let index = *index;
+            render_integrated_with(hl, fonts, keys, move |st, _snap| {
+                st.hovered = Some(index);
+            })
+        }
         Source::Preview(bin) => render_preview(bin),
     }
 }
