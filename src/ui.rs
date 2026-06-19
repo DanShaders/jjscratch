@@ -198,9 +198,26 @@ pub struct FrameLayout {
 /// against the reference drawer band), so the drawer top lands there.
 const DRAWER_H: f64 = 200.0;
 
+/// Minimum width (logical px) the diff/right column must keep after the panel
+/// split. On a narrow window the revision panel is capped so the diff column
+/// never falls below this — otherwise the RevisionHeader buttons + file-tabs
+/// collide/clip (the size-harness bug: a 420px panel left only ~76px of diff at
+/// 500w). Tuned so a 1280-wide window is unaffected (1280 − 4 divider − 360 =
+/// 916 ≥ the 420 default, so the default panel is untouched), while a 640-wide
+/// window shrinks the panel to ~276 instead of clipping the diff.
+const MIN_DIFF_W: f64 = 360.0;
+
 impl FrameLayout {
     pub fn compute(w: f64, h: f64, panel_w: f64, view: View, drawer_open: bool) -> Self {
         let panel_w = panel_w.clamp(L::REVISION_PANEL_MIN_W, L::REVISION_PANEL_MAX_W);
+        // Cap the panel against the WINDOW width so the diff column keeps a
+        // sensible minimum: a narrow window shrinks the panel rather than
+        // squeezing the diff into a clipping sliver. The floor keeps the panel
+        // usable even on extremely narrow windows (it may then exceed the diff
+        // minimum, but the graph stays readable). `REVISION_PANEL_MIN_W` is the
+        // floor; the [280,600] clamp above remains the user-set bound.
+        let max_panel_w = (w - L::PANEL_DIVIDER_W - MIN_DIFF_W).max(L::REVISION_PANEL_MIN_W);
+        let panel_w = panel_w.min(max_panel_w);
         let mut y = 0.0;
         let toolbar = Rect::new(0.0, y, w, y + L::TOOLBAR_H);
         y += L::TOOLBAR_H;

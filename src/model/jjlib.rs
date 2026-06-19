@@ -563,7 +563,8 @@ pub struct OpEntry {
     /// Human description of the operation (jj records the command line here,
     /// e.g. `describe -m ...`, `snapshot working copy`).
     pub description: String,
-    /// Short, mostly-relative age string (e.g. `now`, `5m`, `3h`, `2d`).
+    /// Full operation timestamp, formatted like jj/lightjj's `op log`:
+    /// `2026-01-15 10:00:00.000 +00:00` (date + ms-precision time + `±HH:MM`).
     pub time: String,
     /// Badges: `"current"` for the head operation, `"snapshot"` for pure
     /// working-copy snapshots.
@@ -591,12 +592,6 @@ pub fn oplog(loaded: &Loaded, limit: usize) -> anyhow::Result<Vec<OpEntry>> {
     let head = loaded.repo.operation().clone();
     let head_id = head.id().clone();
 
-    // Wall-clock "now" in epoch-ms, for relative-age formatting.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-
     let entries = pollster::block_on(async {
         let mut stream = std::pin::pin!(op_walk::walk_ancestors(std::slice::from_ref(&head)));
         let mut out: Vec<OpEntry> = Vec::new();
@@ -612,8 +607,11 @@ pub fn oplog(loaded: &Loaded, limit: usize) -> anyhow::Result<Vec<OpEntry>> {
 
             let meta = op.metadata();
             // The op's end time is when it finished — what jj's `op log` shows.
-            let end_ms = meta.time.end.timestamp.0;
-            let time = relative_age(now_ms, end_ms);
+            // lightjj's OplogPanel renders the FULL timestamp (not a relative
+            // age), so we format it exactly like jj's default `op log`:
+            // `2026-01-15 10:00:00.000 +00:00`.
+            let end = meta.time.end;
+            let time = format_jj_timestamp(end.timestamp.0, end.tz_offset);
 
             let mut tags = Vec::new();
             if id == &head_id {
@@ -646,30 +644,58 @@ pub fn oplog(loaded: &Loaded, limit: usize) -> anyhow::Result<Vec<OpEntry>> {
     Ok(entries)
 }
 
-/// Compact relative-age string (`now`, `5m`, `3h`, `2d`, `4mo`, `2y`), mirroring
-/// lightjj's `relativeTime`. `now_ms`/`then_ms` are epoch-milliseconds.
-fn relative_age(now_ms: i64, then_ms: i64) -> String {
-    let secs = (now_ms - then_ms).max(0) / 1000;
-    if secs < 60 {
-        return "now".to_string();
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}m");
-    }
-    let hrs = mins / 60;
-    if hrs < 24 {
-        return format!("{hrs}h");
-    }
-    let days = hrs / 24;
-    if days < 30 {
-        return format!("{days}d");
-    }
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months}mo");
-    }
-    format!("{}y", days / 365)
+/// Format an operation timestamp the way jj/lightjj's `op log` does:
+/// `2026-01-15 10:00:00.000 +00:00` — i.e. `%Y-%m-%d %H:%M:%S%.3f %:z` in the
+/// timestamp's own recorded timezone. `ts_ms` is epoch-milliseconds (UTC);
+/// `tz_offset_min` is the offset east of UTC in **minutes** (jj-lib's
+/// `Timestamp::tz_offset`).
+///
+/// We format the civil date/time by hand (no chrono dependency): the epoch-ms is
+/// shifted into local time by the offset, split into days + ms-of-day, and the
+/// day count is converted to a Gregorian (y, m, d) with the standard civil-from-
+/// days algorithm. This is deterministic and matches jj's display exactly.
+fn format_jj_timestamp(ts_ms: i64, tz_offset_min: i32) -> String {
+    // Shift UTC epoch-ms into the recorded local zone.
+    let local_ms = ts_ms + tz_offset_min as i64 * 60_000;
+
+    // Split into whole days since the epoch and the millisecond-of-day,
+    // using euclidean math so pre-epoch instants floor correctly.
+    let day = local_ms.div_euclid(86_400_000);
+    let ms_of_day = local_ms.rem_euclid(86_400_000);
+
+    let ms = (ms_of_day % 1000) as u32;
+    let total_secs = ms_of_day / 1000;
+    let hour = (total_secs / 3600) as u32;
+    let minute = ((total_secs % 3600) / 60) as u32;
+    let second = (total_secs % 60) as u32;
+
+    let (year, month, dom) = civil_from_days(day);
+
+    // Timezone suffix `±HH:MM` (jj prints a signed, zero-padded offset).
+    let sign = if tz_offset_min < 0 { '-' } else { '+' };
+    let abs = tz_offset_min.unsigned_abs();
+    let tz_h = abs / 60;
+    let tz_m = abs % 60;
+
+    format!(
+        "{year:04}-{month:02}-{dom:02} {hour:02}:{minute:02}:{second:02}.{ms:03} {sign}{tz_h:02}:{tz_m:02}"
+    )
+}
+
+/// Convert a count of days since 1970-01-01 to a proleptic-Gregorian
+/// `(year, month, day)`. Howard Hinnant's well-known `civil_from_days`
+/// algorithm (valid for the full i64 range we care about).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn map_edge(kind: GraphEdgeType) -> EdgeType {
@@ -1352,6 +1378,21 @@ mod tests {
             assert!(!op.id.is_empty(), "op id should be a non-empty hex prefix");
             assert!(!op.time.is_empty(), "op time should be formatted");
             assert!(op.id.chars().all(|c| c.is_ascii_hexdigit()), "id is hex");
+            // Full timestamp like `2026-01-15 10:00:00.000 +00:00`: 10 date
+            // chars, a space, 12 time chars (HH:MM:SS.mmm), a space, then a
+            // signed `±HH:MM` offset — 30 chars total (`YYYY` may widen for
+            // far-future years, but the fixture is 2026).
+            let t = &op.time;
+            assert_eq!(t.len(), 30, "timestamp should be full-width: {t:?}");
+            assert_eq!(&t[4..5], "-", "date sep: {t:?}");
+            assert_eq!(&t[7..8], "-", "date sep: {t:?}");
+            assert_eq!(&t[13..14], ":", "time sep: {t:?}");
+            assert_eq!(&t[19..20], ".", "ms sep: {t:?}");
+            assert_eq!(&t[23..24], " ", "tz sep: {t:?}");
+            assert!(
+                t.as_bytes()[24] == b'+' || t.as_bytes()[24] == b'-',
+                "tz sign: {t:?}"
+            );
         }
 
         // The very first entry is the head (newest), which carries `current`.
@@ -1363,6 +1404,32 @@ mod tests {
         // The `limit` is respected.
         let two = oplog(&loaded, 2).expect("oplog limited");
         assert!(two.len() <= 2, "limit should cap the entry count");
+    }
+
+    #[test]
+    fn formats_full_timestamp() {
+        // 2026-01-15 10:00:00.000 UTC == 1768471200000 ms since epoch.
+        // (The exact value the fixture's reference oplog.png renders.)
+        let ms = 1_768_471_200_000;
+        assert_eq!(
+            format_jj_timestamp(ms, 0),
+            "2026-01-15 10:00:00.000 +00:00"
+        );
+        // A positive offset shifts the wall clock forward; +5:30 (330 min).
+        assert_eq!(
+            format_jj_timestamp(ms, 330),
+            "2026-01-15 15:30:00.000 +05:30"
+        );
+        // A negative offset (-08:00) and sub-second ms.
+        assert_eq!(
+            format_jj_timestamp(ms + 123, -480),
+            "2026-01-15 02:00:00.123 -08:00"
+        );
+        // The Unix epoch itself.
+        assert_eq!(
+            format_jj_timestamp(0, 0),
+            "1970-01-01 00:00:00.000 +00:00"
+        );
     }
 
     #[test]

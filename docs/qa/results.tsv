@@ -6,13 +6,13 @@ default_1280x800@3	1280x800	@3	def	PASS
 tallnarrow_600x900@2	600x900	@2	def	PASS	
 wide_2560x1080@2	2560x1080	@2	def	WARN	near-flat image: only 2 distinct sampled colors {(15, 15, 19), (37, 21, 25)}
 huge_3440x1440@2	3440x1440	@2	def	FAIL	render TIMED OUT after 90s (device 3440x1440@2 too large for lavapipe?)
-belowmin_500x400@1	500x400	@1	def	WARN	right content column only 76px wide (panel pinned at x=420, no auto-shrink) — squeezed
+belowmin_500x400@1	500x400	@1	def	PASS	
 veryshort_1000x300@2	1000x300	@2	def	PASS	
 revisions_1280x800@2	1280x800	@2	1	PASS	
-branches_1280x800@2	1280x800	@2	2	WARN	near-flat image: only 2 distinct sampled colors {(15, 15, 19), (23, 23, 25)}
+branches_1280x800@2	1280x800	@2	2	FAIL	degenerate: entire sampled grid is flat (15, 15, 19)
 oplog_1280x800@2	1280x800	@2	4	PASS	
 light_1280x800@2	1280x800	@2	t	PASS	
 revisions_800x600@1	800x600	@1	1	PASS	
 branches_800x600@1	800x600	@1	2	PASS	
-oplog_800x600@1	800x600	@1	4	WARN	near-flat image: only 2 distinct sampled colors {(15, 15, 19), (22, 22, 26)}
+oplog_800x600@1	800x600	@1	4	PASS	
 light_800x600@1	800x600	@1	t	PASS	

@@ -153,11 +153,20 @@ fn revision_header(
     };
     let id8: String = change_id.chars().take(8).collect();
 
+    // The change-id/description text sits in the UPPER half of the 41px band in
+    // lightjj's reference (docs/reference/revisions.png): its ink centroid lands
+    // ~4.5px above the band center, while the right-aligned "Describe" button is
+    // centered on `cy`. (lightjj's RevisionHeader is a flex row whose title block
+    // is top-anchored above a second meta line that we don't render, so the title
+    // text reads high.) Matching that fixes the ~4px-too-low render the band-edge
+    // comparison flagged. Only the text is raised; the button stays on `cy`.
+    let text_cy = cy - 4.5;
+
     let x = r.x0 + PAD_X;
     // change-id: mono, amber, weight 600, fs-md.
     let after_id = text::draw_text(
         scene, &ctx.fonts.mono_bold, font::FS_MD, t.amber,
-        x, baseline_for(cy, font::FS_MD, &ctx.fonts.mono_bold), &id8,
+        x, baseline_for(text_cy, font::FS_MD, &ctx.fonts.mono_bold), &id8,
     );
     let (dtext, dcolor) = if empty {
         ("(no description)".to_string(), t.text_faint)
@@ -166,7 +175,7 @@ fn revision_header(
     };
     text::draw_text(
         scene, &ctx.fonts.ui, font::FS_MD, dcolor,
-        after_id + 10.0, baseline_for(cy, font::FS_MD, &ctx.fonts.ui), &dtext,
+        after_id + 10.0, baseline_for(text_cy, font::FS_MD, &ctx.fonts.ui), &dtext,
     );
 
     // "Describe" ghost button, right-aligned.
