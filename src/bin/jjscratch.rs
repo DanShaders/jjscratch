@@ -46,17 +46,17 @@ mod real {
 
     use anyhow::{Context, Result};
     use winit::application::ApplicationHandler;
-    use winit::dpi::LogicalSize;
-    use winit::event::{ElementState, WindowEvent};
+    use winit::dpi::{LogicalSize, PhysicalPosition};
+    use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
     use winit::keyboard::{Key, ModifiersState, NamedKey};
     use winit::window::{Window, WindowId};
 
-    use jjscratch::input;
+    use jjscratch::input::{self, DragState, MouseEvent, MouseOutcome};
     use jjscratch::model::jjlib;
     use jjscratch::model::{CommitDiff, Snapshot};
     use jjscratch::text::Fonts;
-    use jjscratch::ui::{self, Frame, UiState};
+    use jjscratch::ui::{self, Frame, FrameLayout, UiState};
     use jjscratch::watch::{ReactiveReloader, Watcher};
     use jjscratch::window::WindowRenderer;
     use vello::Scene;
@@ -161,6 +161,8 @@ mod real {
             window: None,
             renderer: None,
             modifiers: ModifiersState::empty(),
+            drag: DragState::default(),
+            cursor: PhysicalPosition::new(0.0, 0.0),
         };
         event_loop.run_app(&mut app).context("winit event loop")?;
         Ok(())
@@ -342,6 +344,13 @@ mod real {
         window: Option<Arc<Window>>,
         renderer: Option<WindowRenderer>,
         modifiers: ModifiersState,
+        /// In-progress divider drag, threaded through `input::handle_mouse`
+        /// across Down/Move/Up (lightjj's transient `draggingDivider`).
+        drag: DragState,
+        /// Last cursor position in LOGICAL window coordinates. winit reports the
+        /// cursor on `CursorMoved`, but click/wheel events carry no position, so
+        /// we remember the latest move and reuse it for those.
+        cursor: PhysicalPosition<f64>,
     }
 
     impl App {
@@ -448,6 +457,64 @@ mod real {
             // drawer, palette query), so always request a redraw.
             true
         }
+
+        /// The frame layout at the window's current LOGICAL size — the same one
+        /// `redraw` lays the scene out at (and `build_scene` recomputes), so a
+        /// pointer hit-test maps to exactly the geometry on screen. Returns
+        /// `None` before the window exists.
+        fn layout(&self) -> Option<FrameLayout> {
+            let window = self.window.as_ref()?;
+            let phys = window.inner_size();
+            let scale = window.scale_factor();
+            let logical_w = phys.width.max(1) as f64 / scale;
+            let logical_h = phys.height.max(1) as f64 / scale;
+            let drawer_open = self.state.oplog_open || self.state.evolog_open;
+            Some(FrameLayout::compute(
+                logical_w,
+                logical_h,
+                self.state.panel_width,
+                self.state.active_view,
+                drawer_open,
+            ))
+        }
+
+        /// Route a translated pointer event through `input::handle_mouse` and
+        /// react. Returns `true` if a redraw is warranted (the caller requests
+        /// it). On a selection change we reload the selected commit's diff via
+        /// the same path the keyboard navigation uses.
+        fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+            let Some(layout) = self.layout() else {
+                return false;
+            };
+            let outcome = input::handle_mouse(
+                ev,
+                &mut self.state,
+                &self.data.snapshot,
+                &layout,
+                &mut self.drag,
+                &self.fonts,
+            );
+            match outcome {
+                MouseOutcome::SelectionChanged => {
+                    self.data.refresh_selected_diff(&self.state);
+                    true
+                }
+                MouseOutcome::Redraw => true,
+                MouseOutcome::None => false,
+            }
+        }
+
+        /// Current cursor position in LOGICAL window coordinates (physical px
+        /// divided by the HiDPI scale factor), matching the logical layout the
+        /// UI lays out at. winit reports cursor positions in physical px.
+        fn cursor_logical(&self) -> (f64, f64) {
+            let scale = self
+                .window
+                .as_ref()
+                .map(|w| w.scale_factor())
+                .unwrap_or(1.0);
+            (self.cursor.x / scale, self.cursor.y / scale)
+        }
     }
 
     impl ApplicationHandler<AppEvent> for App {
@@ -523,10 +590,72 @@ mod real {
                     }
                 }
 
-                // TODO(mouse): route winit cursor/click/wheel to
-                // jjscratch::input::handle_mouse once merged. The mouse agent
-                // owns src/input.rs / src/ui.rs hit-testing; wire
-                // WindowEvent::{CursorMoved, MouseInput, MouseWheel} here then.
+                // Mouse: translate winit pointer events into the shared
+                // `input::MouseEvent` (logical coords) and route them through
+                // `input::handle_mouse`, the same pure router the cross-driver
+                // harness uses. winit reports positions in PHYSICAL px, so we
+                // convert to logical (÷ scale_factor) to match the logical size
+                // the UI lays out at (see `redraw`/`cursor_logical`).
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor = position;
+                    let (x, y) = self.cursor_logical();
+                    if self.on_mouse(MouseEvent::Move { x, y }) {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                }
+
+                WindowEvent::MouseInput { state, button, .. } => {
+                    // Map winit's button enum to the router's 0=Left/1=Middle/
+                    // 2=Right convention; ignore extra/back/forward buttons.
+                    let btn = match button {
+                        MouseButton::Left => Some(0u8),
+                        MouseButton::Middle => Some(1u8),
+                        MouseButton::Right => Some(2u8),
+                        _ => None,
+                    };
+                    let (x, y) = self.cursor_logical();
+                    let ev = match state {
+                        // Up carries no button (it only ends a divider drag).
+                        ElementState::Released => Some(MouseEvent::Up { x, y }),
+                        ElementState::Pressed => btn.map(|b| MouseEvent::Down { x, y, button: b }),
+                    };
+                    if let Some(ev) = ev {
+                        if self.on_mouse(ev) {
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
+                    }
+                }
+
+                WindowEvent::MouseWheel { delta, .. } => {
+                    // Normalize both wheel encodings to a logical-pixel scroll
+                    // step (down = positive, matching `MouseEvent::Wheel`).
+                    // LineDelta is in text lines; scale by a sensible per-line
+                    // step. PixelDelta (precise trackpads) is physical px → ÷
+                    // scale to logical. winit's sign is up = positive, so negate
+                    // to make scrolling down advance the content.
+                    const LINE_STEP: f64 = 40.0;
+                    let delta_y = match delta {
+                        MouseScrollDelta::LineDelta(_, lines) => -(lines as f64) * LINE_STEP,
+                        MouseScrollDelta::PixelDelta(pos) => {
+                            let scale = self
+                                .window
+                                .as_ref()
+                                .map(|w| w.scale_factor())
+                                .unwrap_or(1.0);
+                            -pos.y / scale
+                        }
+                    };
+                    let (x, y) = self.cursor_logical();
+                    if self.on_mouse(MouseEvent::Wheel { x, y, delta_y }) {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                }
 
                 WindowEvent::Resized(size) => {
                     if let Some(r) = self.renderer.as_mut() {
