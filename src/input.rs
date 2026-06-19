@@ -138,8 +138,16 @@ pub fn handle_key(key: &str, state: &mut UiState, snapshot: &Snapshot) -> bool {
     }
 
     // Keep `selected` in range even if it was somehow out of bounds coming in
-    // (e.g. a snapshot shrank). This never widens it past the last row.
-    if len != 0 && state.selected > last {
+    // (e.g. a snapshot shrank out from under the cursor, or a stale `UiState` was
+    // restored against a different snapshot). An empty snapshot pins it to 0
+    // (there is no row to select); otherwise it is clamped to the last row,
+    // never widened past it. This is the single authority that upholds the
+    // `selected < nodes.len()` (or 0) invariant the renderer relies on, no
+    // matter which navigation key ran above — in particular `k` on an empty
+    // snapshot with a stale nonzero `selected` would otherwise leave it nonzero.
+    if len == 0 {
+        state.selected = 0;
+    } else if state.selected > last {
         state.selected = last;
     }
 
@@ -271,6 +279,120 @@ mod tests {
         assert!(!handle_key("j", &mut st, &snap));
         assert!(!handle_key("k", &mut st, &snap));
         assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn empty_snapshot_with_stale_selection_is_pinned_to_zero() {
+        // CHAOS regression: a stale `UiState` (selection left over from a larger
+        // snapshot) must be coerced back to 0 the moment a navigation key runs
+        // against an empty snapshot — otherwise `k`/ArrowUp would decrement a
+        // bogus index and leave `selected` nonzero, violating the renderer's
+        // `selected < nodes.len()` (or 0) invariant.
+        let mut snap = mock::snapshot();
+        snap.nodes.clear();
+        let mut st = state_at(5); // stale: there are no rows
+        handle_key("k", &mut st, &snap);
+        assert_eq!(st.selected, 0, "k on an empty snapshot must pin selection to 0");
+        st.selected = 9;
+        handle_key("j", &mut st, &snap);
+        assert_eq!(st.selected, 0, "j on an empty snapshot must pin selection to 0");
+        st.selected = 3;
+        handle_key("ArrowUp", &mut st, &snap);
+        assert_eq!(st.selected, 0, "ArrowUp on an empty snapshot must pin selection to 0");
+    }
+
+    #[test]
+    fn stale_overflow_selection_is_clamped_to_last_row() {
+        // A selection past the end of a (non-empty) snapshot is clamped to the
+        // last row on the next navigation key, never read out of bounds.
+        let snap = mock::snapshot();
+        let last = snap.nodes.len() - 1;
+        let mut st = state_at(usize::MAX); // wildly stale
+        handle_key("k", &mut st, &snap);
+        assert_eq!(st.selected, last, "overflow selection clamps to the last row");
+    }
+
+    #[test]
+    fn jk_spam_past_both_bounds_stays_in_range() {
+        // CHAOS regression: hammering j then k far past both ends must keep the
+        // selection a valid index the whole time and never wrap or overflow.
+        let snap = mock::snapshot();
+        let last = snap.nodes.len() - 1;
+        let mut st = state_at(0);
+        for _ in 0..1000 {
+            handle_key("j", &mut st, &snap);
+            assert!(st.selected <= last, "j must never escape the bottom bound");
+        }
+        assert_eq!(st.selected, last);
+        for _ in 0..1000 {
+            handle_key("k", &mut st, &snap);
+            assert!(st.selected <= last, "k must keep a valid index");
+        }
+        assert_eq!(st.selected, 0, "k spam lands and clamps at the top");
+    }
+
+    #[test]
+    fn palette_backspace_storm_on_empty_query_is_a_noop() {
+        // CHAOS regression: Backspace on an already-empty query must not panic
+        // or corrupt the (UTF-8) query string.
+        let snap = mock::snapshot();
+        let mut st = state_at(0);
+        handle_key("cmd+k", &mut st, &snap);
+        for _ in 0..50 {
+            handle_key("Backspace", &mut st, &snap);
+        }
+        assert!(st.palette_query.is_empty());
+        assert!(st.palette_open, "backspacing an empty query must not close the palette");
+    }
+
+    #[test]
+    fn palette_unicode_typing_and_backspace_stays_valid_utf8() {
+        // CHAOS regression: typing multi-byte chars then backspacing must delete
+        // whole `char`s (String::pop), never split a UTF-8 boundary.
+        let snap = mock::snapshot();
+        let mut st = state_at(0);
+        handle_key("cmd+k", &mut st, &snap);
+        for k in ["é", "中", "ß", "💥"] {
+            handle_key(k, &mut st, &snap);
+        }
+        assert_eq!(st.palette_query, "é中ß💥");
+        // Backspace removes one whole char at a time.
+        handle_key("Backspace", &mut st, &snap);
+        assert_eq!(st.palette_query, "é中ß");
+        // Control chars are rejected, not appended.
+        handle_key("\u{0}", &mut st, &snap);
+        assert_eq!(st.palette_query, "é中ß", "control chars must not enter the query");
+    }
+
+    #[test]
+    fn junk_keys_are_inert() {
+        // CHAOS regression: unrecognized / empty / multi-char / unicode key
+        // tokens must be pure no-ops (no panic, no state change) when the palette
+        // is closed.
+        let snap = mock::snapshot();
+        let mut st = state_at(2);
+        for k in ["", "qwerty", "💥", "\u{0}", "\n", "F1", "Shift", "cmd+j", "中"] {
+            assert!(!handle_key(k, &mut st, &snap), "junk key {k:?} must not move cursor");
+        }
+        assert_eq!(st.selected, 2);
+        assert_eq!(st.active_view, View::Revisions);
+        assert_eq!(st.theme, Theme::Dark);
+        assert!(!st.oplog_open && !st.evolog_open && !st.palette_open);
+    }
+
+    #[test]
+    fn drawers_stay_mutually_exclusive_under_toggle_storm() {
+        // CHAOS regression: any interleaving of 4/5 must never leave both bottom
+        // drawers open at once.
+        let snap = mock::snapshot();
+        let mut st = state_at(0);
+        for k in ["4", "5", "4", "4", "5", "5", "4", "5"] {
+            handle_key(k, &mut st, &snap);
+            assert!(
+                !(st.oplog_open && st.evolog_open),
+                "at most one bottom drawer open at a time (after {k})"
+            );
+        }
     }
 
     #[test]
