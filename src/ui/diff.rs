@@ -793,3 +793,120 @@ fn tokenize(line: &str, t: &Palette, base: Color) -> Vec<(String, Color)> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DiffLine, Hunk, LineKind};
+
+    fn line(kind: LineKind, o: Option<u32>, n: Option<u32>) -> DiffLine {
+        DiffLine { kind, old_no: o, new_no: n, text: "x".into() }
+    }
+
+    fn modified_file(hunks: Vec<Hunk>) -> FileDiff {
+        FileDiff { path: "src/a.rs".into(), status: ChangeStatus::Modified, added: 1, removed: 1, hunks }
+    }
+
+    /// `file_block_height` must equal the sum of the same fixed-height pieces the
+    /// real `file_block` walk lays out, so skipping an off-screen block advances
+    /// `y` to the exact position a full draw would reach (windowing invisible).
+    #[test]
+    fn file_block_height_matches_layout_pieces() {
+        // A Modified file: first displayed line is line 10 (so a leading elision
+        // appears), then a hunk header + 4 lines, plus the trailing "rest of file".
+        let hunk = Hunk {
+            old_start: 10, old_len: 2, new_start: 10, new_len: 2,
+            header_context: String::new(),
+            lines: vec![
+                line(LineKind::Context, Some(10), Some(10)),
+                line(LineKind::Remove, Some(11), None),
+                line(LineKind::Add, None, Some(11)),
+                line(LineKind::Context, Some(12), Some(12)),
+            ],
+        };
+        let file = modified_file(vec![hunk]);
+
+        let header = 7.0 + font::FS_MD as f64 + 8.0 + 7.0;
+        let leading_elision = L::DIFF_LINE_H + 4.0; // first line is 10 → 9 hidden
+        let hunk_header = 3.0 + font::FS_SM as f64 + 6.0 + 3.0;
+        let hunk_lines = 4.0 * L::DIFF_LINE_H;
+        let rest_of_file = L::DIFF_LINE_H + 4.0;
+        let expected = header + leading_elision + hunk_header + hunk_lines + rest_of_file;
+
+        assert_eq!(file_block_height(&file), expected);
+    }
+
+    /// No leading elision when the first displayed line is line 1 (nothing hidden
+    /// above it), and an Added file gets no trailing "rest of file" affordance.
+    #[test]
+    fn file_block_height_no_elisions() {
+        let hunk = Hunk {
+            old_start: 0, old_len: 0, new_start: 1, new_len: 2,
+            header_context: String::new(),
+            lines: vec![
+                line(LineKind::Add, None, Some(1)),
+                line(LineKind::Add, None, Some(2)),
+            ],
+        };
+        let file = FileDiff {
+            path: "new.rs".into(), status: ChangeStatus::Added, added: 2, removed: 0,
+            hunks: vec![hunk],
+        };
+        let header = 7.0 + font::FS_MD as f64 + 8.0 + 7.0;
+        let hunk_header = 3.0 + font::FS_SM as f64 + 6.0 + 3.0;
+        let hunk_lines = 2.0 * L::DIFF_LINE_H;
+        // Added → no trailing "rest of file"; first new line is 1 → no leading elision.
+        assert_eq!(file_block_height(&file), header + hunk_header + hunk_lines);
+    }
+
+    /// The outer file loop skips a file fully above the viewport by advancing `y`
+    /// by `file_block_height` — the set of files it actually *draws* must equal a
+    /// reference that keeps every file intersecting the viewport.
+    #[test]
+    fn diff_file_windowing_skips_offscreen_blocks() {
+        let mk = |first: u32, nlines: usize| {
+            let lines: Vec<DiffLine> = (0..nlines)
+                .map(|i| line(LineKind::Context, Some(first + i as u32), Some(first + i as u32)))
+                .collect();
+            modified_file(vec![Hunk {
+                old_start: first, old_len: nlines as u32, new_start: first, new_len: nlines as u32,
+                header_context: String::new(), lines,
+            }])
+        };
+        let files: Vec<FileDiff> = (0..40).map(|_| mk(1, 5)).collect();
+
+        let view_top = 0.0;
+        let view_bottom = 600.0;
+        for &scroll in &[0.0, 50.0, 200.0, 777.0, 3000.0, 1e6] {
+            let mut y = -scroll;
+
+            // Reference: every file whose [y, y+h) intersects the viewport.
+            let mut full = Vec::new();
+            let mut yy = -scroll;
+            for (i, f) in files.iter().enumerate() {
+                let h = file_block_height(f);
+                if yy <= view_bottom && yy + h >= view_top {
+                    full.push(i);
+                }
+                yy += h;
+            }
+
+            // Windowed: mirror render()'s loop (break past bottom, skip fully-above).
+            let mut win = Vec::new();
+            for (i, f) in files.iter().enumerate() {
+                if y > view_bottom {
+                    break;
+                }
+                let h = file_block_height(f);
+                if y + h < view_top {
+                    y += h;
+                    continue;
+                }
+                win.push(i);
+                y += h;
+            }
+
+            assert_eq!(win, full, "scroll={scroll}: drawn diff files must match cropped reference");
+        }
+    }
+}

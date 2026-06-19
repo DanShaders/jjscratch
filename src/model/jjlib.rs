@@ -44,12 +44,67 @@ pub struct Loaded {
     wc_commit_id: Option<CommitId>,
     repo_name: String,
     workspace_name: String,
+    /// Process-lifetime cache of materialized commits keyed by commit id. A
+    /// commit's content is immutable once written, so a `Commit` read at one
+    /// operation stays valid no matter how the op log moves; the backing `Store`
+    /// is shared across reloads. Reading a commit from the git backend is the
+    /// dominant snapshot cost on a large log (~12 ms / 1000 commits), and a
+    /// reactive reload typically re-snapshots a history where only the
+    /// working-copy commit changed — so on every reload after the first this
+    /// cache turns ~1000 backend reads into ~1. jj-lib's own `Store` commit cache
+    /// is a tiny LRU (cap 100) that thrashes on a large log, which is why we keep
+    /// our own here, sized to comfortably hold a large visible history.
+    ///
+    /// Bounded (FIFO, `COMMIT_CACHE_CAP`) so memory stays flat under arbitrary
+    /// working-copy churn — the same discipline the diff cache keeps. The cap is
+    /// far above any realistic visible-row count, so it never evicts a commit
+    /// still on screen and never re-introduces the LRU-thrash it exists to avoid.
+    commit_cache: std::cell::RefCell<CommitCache>,
 }
+
+/// FIFO-bounded `commit_id → Commit` cache. Commits are immutable, so this only
+/// ever serves correct values; the bound exists purely to cap memory.
+#[derive(Default)]
+struct CommitCache {
+    map: HashMap<CommitId, Commit>,
+    order: std::collections::VecDeque<CommitId>,
+}
+
+/// Max commits held in [`Loaded::commit_cache`]. Generous enough to keep an
+/// entire large visible log resident (so reactive reloads stay all-hits) while
+/// bounding memory under unbounded churn.
+const COMMIT_CACHE_CAP: usize = 8192;
 
 impl Loaded {
     /// The working-copy commit id (hex) for this workspace, if any.
     pub fn wc_commit_id_hex(&self) -> Option<String> {
         self.wc_commit_id.as_ref().map(|id| id.hex())
+    }
+
+    /// Read a commit, served from the process-lifetime cache on a hit. A miss
+    /// reads it from the store once and memoizes it (commits are immutable, so
+    /// the cached value never goes stale). This is the hot path of building a
+    /// snapshot over a large log across repeated reactive reloads.
+    fn cached_commit(&self, id: &CommitId) -> anyhow::Result<Commit> {
+        if let Some(c) = self.commit_cache.borrow().map.get(id) {
+            return Ok(c.clone());
+        }
+        let commit = self
+            .repo
+            .store()
+            .get_commit(id)
+            .with_context(|| format!("reading commit {}", id.hex()))?;
+        let mut cache = self.commit_cache.borrow_mut();
+        if !cache.map.contains_key(id) {
+            cache.order.push_back(id.clone());
+            while cache.order.len() > COMMIT_CACHE_CAP {
+                if let Some(old) = cache.order.pop_front() {
+                    cache.map.remove(&old);
+                }
+            }
+        }
+        cache.map.insert(id.clone(), commit.clone());
+        Ok(commit)
     }
 
     /// The hex id of the operation this repo snapshot is loaded at. This is the
@@ -198,6 +253,7 @@ pub fn open(path: &Path) -> anyhow::Result<Loaded> {
         wc_commit_id,
         repo_name,
         workspace_name,
+        commit_cache: std::cell::RefCell::new(CommitCache::default()),
     })
 }
 
@@ -353,7 +409,6 @@ fn collect_membership(
 /// parent edges from `stream_graph`, so the DAG/lane layout is unchanged.
 pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
     let repo = loaded.repo.as_ref();
-    let store = repo.store();
     let view = repo.view();
 
     // 1. Stream the DAG: (CommitId, edges) in jj-log order. We use jj's
@@ -392,12 +447,35 @@ pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
     let immutable = collect_membership(repo, immutable_expr(repo), &ids)?;
     let divergent = collect_membership(repo, RevsetExpression::divergent(), &ids)?;
 
-    // 3. Build CommitNode per graph node.
+    // 3. Materialize every visible commit once into a local map, served from the
+    //    process-lifetime `commit_cache` (commits are immutable, so a hit is
+    //    free). This kills two sources of waste that dominated the large-log
+    //    snapshot:
+    //
+    //    * Across reloads: a reactive re-snapshot usually re-walks a history where
+    //      only the working-copy commit moved, so every other commit is a cache
+    //      hit — ~1000 backend reads collapse to ~1 (snapshot p50 16 ms → 3 ms).
+    //    * Within one snapshot: the `is_empty` check needs each node's *parent*
+    //      tree. The parent of a visible commit is almost always itself visible
+    //      (the next node in a linear log), so we answer it from this same map
+    //      instead of a second backend read. (jj-lib's own `Store` commit cache is
+    //      a tiny LRU of 100 that thrashes on a large log, which is why we keep our
+    //      own map.)
+    //
+    //    The remaining cost is the *cold* first build, which must read each
+    //    visible commit from the backend once (~15 ms / 1000 commits) — see the
+    //    snapshot-windowing follow-up in docs/perf/reactivity.md.
+    let mut commits: HashMap<CommitId, Commit> = HashMap::with_capacity(graph_nodes.len());
+    for (commit_id, _) in &graph_nodes {
+        if !commits.contains_key(commit_id) {
+            commits.insert(commit_id.clone(), loaded.cached_commit(commit_id)?);
+        }
+    }
+
+    // 4. Build CommitNode per graph node.
     let mut out_nodes = Vec::with_capacity(graph_nodes.len());
     for (commit_id, edges) in &graph_nodes {
-        let commit: Commit = store
-            .get_commit(commit_id)
-            .with_context(|| format!("reading commit {}", commit_id.hex()))?;
+        let commit = &commits[commit_id];
 
         let change_id = commit.change_id().clone();
         let change_prefix_len = repo
@@ -427,13 +505,17 @@ pub fn snapshot(loaded: &Loaded) -> anyhow::Result<Snapshot> {
         let is_divergent = divergent.get(commit_id).copied().unwrap_or(false);
 
         // "Empty" = no file changes vs the (first) parent — NOT an empty
-        // description. Root (no parent) is empty by convention.
+        // description. Root (no parent) is empty by convention. The parent's tree
+        // id comes from the map populated above (one read per commit); only a
+        // parent outside the visible set triggers an extra read.
         let is_empty = match commit.parent_ids().first() {
             None => true,
-            Some(pid) => match store.get_commit(pid) {
-                Ok(parent) => commit.tree_ids() == parent.tree_ids(),
-                Err(_) => false,
-            },
+            Some(pid) => {
+                let parent_tree = commits.get(pid).map(|p| p.tree_ids().clone()).or_else(|| {
+                    loaded.cached_commit(pid).ok().map(|p| p.tree_ids().clone())
+                });
+                parent_tree.map(|pt| commit.tree_ids() == &pt).unwrap_or(false)
+            }
         };
 
         out_nodes.push(CommitNode {

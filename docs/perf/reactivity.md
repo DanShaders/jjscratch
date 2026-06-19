@@ -144,7 +144,10 @@ The loop never deadlocks or grows unboundedly. ✓
 
 ## 4. The gap to 16.6 ms, and the plan
 
-| scenario   | p99 today | budget | gap        | dominant stage |
+> **Historical** — these were the numbers *before* the Myers-diff and the
+> windowing/snapshot-build rounds. For the current state see **§6**.
+
+| scenario   | p99 then  | budget | gap        | dominant stage |
 |------------|-----------|--------|------------|----------------|
 | tiny       | 1.8ms     | 16.6ms | ✅ 0.1×    | — |
 | large-log  | 17.3ms    | 16.6ms | ⚠️ ~1.0×   | **snapshot** |
@@ -238,3 +241,115 @@ The path to <16.6 ms for every scenario is clear and lives mostly in code we own
 or have flagged: **(1) Myers diff + lazy/large-file capping** closes the huge-diff
 gap; **(2) viewport windowing of the Snapshot and of `build_scene`** closes the
 large-log gap and caps everything at O(viewport).
+
+---
+
+## 6. Windowing + snapshot-build round (landed)
+
+This round closed the remaining gaps from §4 within the owned files
+(`src/ui/graph.rs`, `src/ui/diff.rs`, `src/model/jjlib.rs`).
+
+### Measured after (this environment, `--release --features jjlib`)
+
+| scenario   | p50 → | p99 → | budget | dominant residual |
+|------------|-------|-------|--------|-------------------|
+| tiny       | 0.55ms | **1.5ms** ✅ | 16.6ms | — |
+| huge-diff  | 13.5ms | **~15.8ms** ✅ | 16.6ms | diff materialize (cold) |
+| large-log  | **4.1ms** | ~17ms ⚠️ | 16.6ms | **cold** snapshot commit-read |
+
+(p99 is sensitive to machine contention; huge-diff lands inside the frame in an
+unloaded run and right at the edge under load. large-log p50 dropped from ~22 ms
+to ~4 ms; its p99 is the one-time cold build — see below.)
+
+### Viewport windowing of `build_scene` (graph + diff)
+
+Both renderers build **O(visible rows)**, not O(input):
+
+* **Graph** (`ui/graph.rs`): rows are a fixed `ROW_H`, so the first on-screen
+  flattened sub-row is exact arithmetic (`first_visible_row`). The draw loop jumps
+  straight to it — skipping all glyph/measure/gutter work for rows above the
+  viewport — and breaks at the first row past the bottom. Lane/edge continuity is
+  preserved: each row's gutter cells are self-contained, and a partially-scrolled
+  top row still draws its full pipes. The visible output is byte-identical
+  (`windowing_matches_full_walk_cropped` proves the visited-row set equals a full
+  walk cropped to the viewport for a spread of scroll offsets).
+* **Diff** (`ui/diff.rs`): each file block has an exact precomputed pixel height
+  (`file_block_height`, kept in lockstep with `file_block`'s layout), so a file
+  entirely above the viewport is skipped by advancing `y` only — no header /
+  hunk-header / line work — and within an intersecting file the per-line loop skips
+  off-screen lines and breaks past the bottom. `file_block_height_matches_layout_pieces`
+  and `diff_file_windowing_skips_offscreen_blocks` guard the invariants.
+
+The harness's `windowing` micro-benchmark still reports ~73 % "off-screen" at 203
+rows. That residual is **`graph_layout::layout()`**, which builds the lane cells
+for *all* rows (the lane assignment is inherently sequential, and the gutter
+`width_cols` must match the full build to keep `content_x` byte-identical). It is
+sub-millisecond even at 1000 rows and is **never** the frame bottleneck in any
+real scenario (build_scene is ≤1.7 ms everywhere above), so it is intentionally
+left whole; windowing it would risk the byte-identical-gutter invariant for no
+measurable gain.
+
+### Snapshot build cost (large-log)
+
+Profiling the 1000-commit snapshot pinned the cost precisely:
+
+| sub-cost           | before | after |
+|--------------------|--------|-------|
+| `is_empty` (parent read + tree compare) | **13–14 ms** | 0.1 ms |
+| prefix lookups (change + commit) | 0.8 ms | 0.8 ms |
+| membership (immutable + divergent) | 0.8 ms | 0.8 ms |
+| bookmarks_at | 0.04 ms | 0.04 ms |
+| commit read (cold) | (inside is_empty) | ~15 ms (cold only) |
+
+Two fixes, both in `src/model/jjlib.rs`:
+
+1. **One read per commit, not two.** `is_empty` compared each node's tree to its
+   *parent's*, reading the parent from the store — a second `get_commit` per node.
+   jj-lib's `Store` commit cache is a tiny LRU (cap 100) that thrashes on a large
+   log, so that parent read deserialized most commits a second time (~75 % of the
+   whole snapshot). We now materialize each visible commit once into a local map
+   and answer `is_empty` from it (a visible commit's parent is almost always the
+   next visible node). `is_empty` dropped from ~13 ms to ~0.1 ms.
+2. **Process-lifetime commit cache** (`Loaded::commit_cache`, keyed by `commit_id`,
+   served via `cached_commit`). Commits are immutable, so a `Commit` read at one
+   operation is valid no matter how the op log moves. A reactive re-snapshot
+   usually re-walks a history where only the working-copy commit changed, so every
+   other commit is a cache hit — ~1000 backend reads collapse to ~1. This is what
+   takes large-log **p50 from ~16 ms to ~3 ms**.
+
+### Deferred: cold-build snapshot windowing (follow-up plan)
+
+The one residual is the **cold first build** of a large log: it must read every
+visible commit from the git backend once (~15 ms / 1000 commits, an inherent
+deserialize floor with no batch API exposed). That is a one-time startup cost —
+every *reactive* reload after it is a cache hit (~3 ms) — but it keeps large-log
+p99 at the frame edge.
+
+Eliminating it needs **true viewport windowing of the Snapshot**: build full
+`CommitNode`s (the fields that require a commit read — change/commit ids +
+prefixes, author, description, `is_empty`, bookmarks) only for the visible window
++ a small overscan, while keeping the **cheap structural data for ALL nodes**
+(commit id + parent edges + the membership flags, all of which come from
+`stream_graph` / the index *without* a commit read) so the graph lane layout stays
+correct. This was **deliberately deferred** because it is not a safe additive
+change in the files this round owns:
+
+* `snapshot()` has no viewport — it would need a window argument threaded through
+  `ReactiveReloader::reload*` (`src/watch.rs`) and every caller, **and** the
+  perf-harness measures `reload_forced()` (a `src/bin/*` file this round may not
+  edit), so even a correct windowed snapshot would not move the harness number
+  without changing the harness.
+* `CommitNode` is a plain value struct consumed by the graph renderer, the diff
+  panel's `revision_header`, and `working_copy()`. Making its content fields lazy
+  (a placeholder mode for off-screen nodes) is a **`model.rs` contract change** that
+  must not break those consumers; doing it safely means an additive "lazy/full"
+  distinction plus the viewport plumbing above.
+
+Recommended minimal-risk landing for the next round: add
+`snapshot_windowed(loaded, first_row, last_row)` that reads commit content only
+for `[first-overscan, last+overscan]` and fills the rest with structural-only
+nodes; thread `graph_scroll` + panel height from the render loop into
+`ReactiveReloader::reload` so the steady-state path uses it; keep `snapshot()` as
+the full build for non-windowed callers (`drive`, `graphstress`). Pair it with the
+per-commit-metadata cache already landed so only *new* rows in the window are ever
+built.

@@ -88,12 +88,7 @@ pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiStat
     // text measurement, gutter cells) is elided. This makes the draw loop
     // O(visible rows), not O(history).
     let top0 = rect.y0 + LIST_TOP_PAD - state.graph_scroll;
-    let first_visible = if top0 >= rect.y0 {
-        0
-    } else {
-        // Smallest index whose row bottom (top0 + (idx+1)*ROW_H) reaches rect.y0.
-        (((rect.y0 - top0) / L::ROW_H).floor() as usize).min(flat.len())
-    };
+    let first_visible = first_visible_row(top0, rect.y0, flat.len());
 
     let mut y = top0 + first_visible as f64 * L::ROW_H;
     for (node_idx, line) in flat.iter().skip(first_visible) {
@@ -150,6 +145,22 @@ pub fn render(scene: &mut Scene, rect: Rect, snapshot: &Snapshot, state: &UiStat
     }
 
     scene.pop_layer();
+}
+
+/// Index of the first flattened row that can be (partly) on-screen, given the
+/// y of row 0's top (`top0`), the viewport's top edge (`view_top`), and the
+/// total row count. Fixed-height rows make this exact arithmetic, so the draw
+/// loop can jump straight to it instead of walking every off-screen row above.
+/// The result is clamped to `[0, row_count]`.
+fn first_visible_row(top0: f64, view_top: f64, row_count: usize) -> usize {
+    if top0 >= view_top {
+        0
+    } else {
+        // Largest index whose row top is still ≤ view_top, i.e. the row that the
+        // viewport's top edge falls within. `floor` keeps that row (its lower part
+        // is visible); rows strictly above it are fully off-screen.
+        (((view_top - top0) / L::ROW_H).floor() as usize).min(row_count)
+    }
 }
 
 fn lane_color(graph: &[Color; 8], lane: usize) -> Color {
@@ -485,6 +496,83 @@ fn relative_time(ts_ms: i64, now_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The windowed draw must visit exactly the rows a full (un-windowed) walk
+    /// would have *painted* — windowing only elides off-screen work, never
+    /// changes which rows are on-screen. We model both walks over a fixed-height
+    /// row list and assert the visited index sets are identical for a spread of
+    /// scroll offsets, including the partially-scrolled boundary cases.
+    #[test]
+    fn windowing_matches_full_walk_cropped() {
+        let row_h = L::ROW_H;
+        let n_rows = 600usize;
+        let view_top = 100.0;
+        let view_bottom = 100.0 + 800.0; // an 800px content rect
+        let top_pad = LIST_TOP_PAD;
+
+        for &scroll in &[
+            0.0, 5.0, 17.0, 18.0, 19.0, 100.0, 333.0, 1000.0, 5000.0, 10_790.0,
+            // exactly one row, just-under, just-over the last row, way past end:
+            row_h, row_h - 0.01, (n_rows as f64) * row_h, 1e6,
+        ] {
+            let top0 = view_top + top_pad - scroll;
+
+            // Reference: walk ALL rows, keep those intersecting the viewport.
+            let mut full = Vec::new();
+            for i in 0..n_rows {
+                let y = top0 + i as f64 * row_h;
+                if y > view_bottom {
+                    break;
+                }
+                if y + row_h <= view_top {
+                    continue; // entirely above
+                }
+                full.push(i);
+            }
+
+            // Windowed: jump to first_visible, then walk until past the bottom.
+            let first = first_visible_row(top0, view_top, n_rows);
+            let mut win = Vec::new();
+            let mut y = top0 + first as f64 * row_h;
+            for i in first..n_rows {
+                if y > view_bottom {
+                    break;
+                }
+                // The renderer's break uses row.y0 > rect.y1; rows above are never
+                // reached because we started at `first`. Mirror the same gate.
+                if y + row_h > view_top {
+                    win.push(i);
+                }
+                y += row_h;
+            }
+
+            assert_eq!(
+                win, full,
+                "scroll={scroll}: windowed visible rows must equal full-walk cropped"
+            );
+            // And the jump must never skip a row that should be visible: the first
+            // windowed row is ≤ the first reference row.
+            if let (Some(&wf), Some(&ff)) = (win.first(), full.first()) {
+                assert!(wf <= ff, "scroll={scroll}: first windowed row {wf} > first visible {ff}");
+            }
+        }
+    }
+
+    #[test]
+    fn first_visible_row_arithmetic() {
+        // Unscrolled: row 0 starts at/after the viewport top → start at 0.
+        assert_eq!(first_visible_row(100.0, 100.0, 50), 0);
+        assert_eq!(first_visible_row(105.0, 100.0, 50), 0);
+        // Scrolled so rows 0..k are fully above: the k-th row is first visible.
+        // top0 = 100 - k*ROW_H means row k's top lands exactly at the viewport top.
+        let k = 7usize;
+        let top0 = 100.0 - k as f64 * L::ROW_H;
+        assert_eq!(first_visible_row(top0, 100.0, 50), k);
+        // A hair more scroll keeps row k partly visible (floor stays at k).
+        assert_eq!(first_visible_row(top0 - 0.01, 100.0, 50), k);
+        // Clamp to row_count when scrolled past the end.
+        assert_eq!(first_visible_row(100.0 - 1e6, 100.0, 50), 50);
+    }
 
     #[test]
     fn relative_time_buckets() {
