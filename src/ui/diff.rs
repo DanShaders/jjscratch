@@ -205,7 +205,15 @@ fn files_bar(scene: &mut Scene, rect: Rect, y: f64, diff: &CommitDiff, ctx: &Ren
         );
 
         if active {
-            fill_rect(scene, Rect::new(x - 4.0, r.y1 - 2.0, after_stat + 4.0, r.y1), t.amber);
+            // Active-tab underline (lightjj's `border-bottom` on the active file
+            // tab) sits ~2px below the tab text, not on the bar's bottom edge.
+            // Calibrated to docs/reference/revisions.png (device y 262–265 @2x =
+            // logical 131.0–133.0, i.e. r.y1-8 .. r.y1-6).
+            fill_rect(
+                scene,
+                Rect::new(x - 4.0, r.y1 - 8.0, after_stat + 4.0, r.y1 - 6.0),
+                t.amber,
+            );
         }
         x = after_stat + 18.0;
     }

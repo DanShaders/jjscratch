@@ -349,9 +349,14 @@ fn draw_bookmark_line(
                 let tw = text::measure(&ctx.fonts.ui, font::FS_XS, &full) as f64;
                 // padding 0 5 → 5px each side.
                 let w = tw + 10.0;
-                let r = Rect::new(x, cy - 8.0, x + w, cy + 8.0);
+                // Badge box height calibrated to docs/reference/revisions.png: the
+                // reference `main`/`experiment` chips are ~27px tall @2x (≈13.5
+                // logical px), not 16 — so cy ± 6.5.
+                let r = Rect::new(x, cy - 6.5, x + w, cy + 6.5);
                 fill_round(scene, r, 3.0, t.surface0);
-                // Lane-tinted (border = lane@50%, text = lane) unless conflicted.
+                // Lane-tinted (border = lane@50% over the fill, text = lane) unless
+                // conflicted — matches the reference top/bottom border [107,80,37]
+                // (= graph[0] mixed 50% with the surface0 fill), per §4.3.
                 let (border, txt) = if b.conflicted {
                     (t.surface1, t.subtext0)
                 } else {
