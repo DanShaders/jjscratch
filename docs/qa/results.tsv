@@ -1,0 +1,7 @@
+tiny_640x480@1	640x480	@1	def	PASS	
+small_800x600@1	800x600	@1	def	PASS	
+default_1280x800@1	1280x800	@1	def	PASS	
+default_1280x800@2	1280x800	@2	def	PASS	
+default_1280x800@3	1280x800	@3	def	PASS	
+tallnarrow_600x900@2	600x900	@2	def	PASS	
+wide_2560x1080@2	2560x1080	@2	def	WARN	near-flat image: only 2 distinct sampled colors {(15, 15, 19), (37, 21, 25)}
