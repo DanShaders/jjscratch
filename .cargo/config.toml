@@ -1,0 +1,6 @@
+# Headless GPU selection for this environment.
+# Force the Vulkan loader to use lavapipe (llvmpipe software rasterizer) — the
+# only ICD that works without a real GPU / DRI access here. Without this, wgpu
+# may pick a non-functional hardware ICD (intel/radeon/nouveau) and fail.
+[env]
+VK_ICD_FILENAMES = "/usr/share/vulkan/icd.d/lvp_icd.json"

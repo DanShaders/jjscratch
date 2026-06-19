@@ -1,0 +1,24 @@
+[package]
+name = "jjscratch"
+version = "0.1.0"
+edition = "2021"
+description = "jjscratch — a native, GPU-rendered Jujutsu client (Vello + wgpu). UI copy of lightjj."
+
+[dependencies]
+vello = "0.9"
+# skrifa pinned to the same version vello 0.9 uses, for glyph metrics / charmap
+# (vello does not re-export it). Keep in lockstep with vello's skrifa dep.
+skrifa = "0.42"
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+
+[[bin]]
+name = "shot"
+path = "src/bin/shot.rs"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

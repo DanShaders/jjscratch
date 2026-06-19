@@ -1,0 +1,11 @@
+[user]
+name = "Ada Lovelace"
+email = "ada@example.com"
+
+[revset-aliases]
+# Make the `main` bookmark and everything under it immutable (◆ in the UI).
+# present() tolerates the bookmark not existing yet (e.g. before it's created).
+"immutable_heads()" = "present(main) | tags()"
+
+[ui]
+color = "never"
