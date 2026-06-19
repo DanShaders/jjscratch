@@ -20,9 +20,29 @@ use vello::{Glyph, Scene};
 /// Bundled fonts. Self-contained (embedded in the binary) so worktrees and the
 /// headless harness need no system font access.
 ///
-/// DejaVu Sans / Sans Mono are stand-ins for lightjj's CSS font stacks
-/// (system-ui / ui-monospace). Swap the embedded bytes to tune fidelity without
-/// touching call sites.
+/// These are the real fonts from lightjj's CSS font stacks
+/// (docs/spec/ui-spec.md §2.1):
+///   --font-ui   = 'Inter', -apple-system, 'Segoe UI', sans-serif
+///   --font-mono = 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace
+///
+/// Bundled (static, hinted TTFs — NOT the variable fonts, so skrifa glyph
+/// selection stays trivial):
+///   - Inter            v4.1   (rsms/inter release v4.1, extras/ttf static instances)
+///   - JetBrains Mono   v2.304 (JetBrains/JetBrainsMono release v2.304)
+///
+/// Weight mapping:
+///   ui        -> Inter Regular          (400)
+///   ui_bold   -> Inter SemiBold         (600)  -- lightjj's "bold" UI chrome is
+///                overwhelmingly weight 600 (change-id badges, panel titles read
+///                at 600; the few 700 spots look fine in 600). Inter Bold (700)
+///                is also bundled (assets/fonts/Inter-Bold.ttf) if a future split
+///                into a dedicated 700 field is wanted.
+///   mono      -> JetBrains Mono Regular (400)
+///   mono_bold -> JetBrains Mono Bold    (700)
+///
+/// Both families are SIL OFL 1.1 (see Inter-OFL.txt / JetBrainsMono-OFL.txt in
+/// assets/fonts/). Swap the embedded bytes to tune fidelity without touching
+/// call sites.
 pub struct Fonts {
     pub ui: FontData,
     pub ui_bold: FontData,
@@ -41,10 +61,10 @@ macro_rules! embed_font {
 impl Fonts {
     pub fn bundled() -> Self {
         Self {
-            ui: embed_font!("DejaVuSans.ttf"),
-            ui_bold: embed_font!("DejaVuSans-Bold.ttf"),
-            mono: embed_font!("DejaVuSansMono.ttf"),
-            mono_bold: embed_font!("DejaVuSansMono-Bold.ttf"),
+            ui: embed_font!("Inter-Regular.ttf"),
+            ui_bold: embed_font!("Inter-SemiBold.ttf"),
+            mono: embed_font!("JetBrainsMono-Regular.ttf"),
+            mono_bold: embed_font!("JetBrainsMono-Bold.ttf"),
         }
     }
 }
