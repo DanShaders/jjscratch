@@ -67,8 +67,12 @@ pub struct MockCommitGroup {
 }
 
 /// Which side a result line / block currently carries — drives its tint
-/// (green/blue/amber) exactly like MergePanel's `merge-from-*` classes.
+/// (green/blue/amber) exactly like MergePanel's `merge-from-*` classes. The full
+/// set mirrors `BlockSource` ('ours'|'theirs'|'both'|'mixed'); the greeting.txt
+/// reference mock only exercises `Theirs`/`Context`, but `Both`/`Mixed` stay so
+/// renderer + integration cover every `merge-from-*` case.
 #[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Both/Mixed are contract variants; not in the reference mock.
 pub enum Side {
     Ours,
     Theirs,
@@ -93,6 +97,9 @@ pub struct MockBlock {
     pub result_to: usize,
     /// Current source of the block's result content.
     pub source: Side,
+    /// This block is the keyboard-nav "current" one (`.merge-arrow-current` →
+    /// amber ring on its arrows + minimap chip).
+    pub current: bool,
 }
 
 /// The full mock conflict set: the open file's three sides + blocks, plus the
@@ -102,8 +109,13 @@ pub struct MockConflict {
     pub open_path: &'static str,
     /// `oursRef` short change-id shown in the ours header.
     pub ours_ref: &'static str,
+    /// `oursLabel` (MergePanel `sides.oursLabel`) — appended after the ref as
+    /// `·{label}`. Defaults in lightjj to "Ours (side #1)".
+    pub ours_label: &'static str,
     /// `theirsRef` short change-id shown in the theirs header.
     pub theirs_ref: &'static str,
+    /// `theirsLabel` (MergePanel `sides.theirsLabel`).
+    pub theirs_label: &'static str,
     pub ours: Vec<PaneLine>,
     pub result: Vec<PaneLine>,
     pub theirs: Vec<PaneLine>,
@@ -113,90 +125,48 @@ pub struct MockConflict {
     pub groups: Vec<MockCommitGroup>,
 }
 
-/// Representative stub: three conflicted files across two commits; the open file
-/// (`src/api.rs`) has two conflict blocks — one resolved to "ours", one still
-/// pending on "theirs".
+/// Mirrors the committed conflict fixture (`fixture-conflict/repo`) that
+/// `docs/reference/merge.png` was captured against: a merge commit `uylryrpk`
+/// ("merge: combine features") with a single conflicted `greeting.txt`. Its one
+/// 2-sided block differs on line 2 — ours (`zvntrlvk` "feature-a") = "FEATURE A
+/// change", theirs (`lopwknrv` "feature-b") = "FEATURE B change". The result is
+/// seeded from theirs and still pending (block source = Theirs → 0/1, amber).
 pub fn mock() -> MockConflict {
     use Side::*;
-    // ours pane — read-only side #1.
+    // ours pane (feature-a) — read-only side #1.
     let ours = vec![
-        PaneLine { text: "pub fn connect(addr: &str) -> Result<Conn> {", kind: Context },
-        PaneLine { text: "    let cfg = Config::from_env()?;", kind: Context },
-        PaneLine { text: "    let timeout = Duration::from_secs(30);", kind: Ours },
-        PaneLine { text: "    let conn = Conn::dial(addr, cfg)?;", kind: Context },
-        PaneLine { text: "    conn.set_timeout(timeout);", kind: Context },
-        PaneLine { text: "    retry_backoff(conn, 5)", kind: Ours },
-        PaneLine { text: "}", kind: Context },
-        PaneLine { text: "", kind: Context },
-        PaneLine { text: "fn retry_backoff(c: Conn, n: u32) -> Result<Conn> {", kind: Context },
-        PaneLine { text: "    let base = Duration::from_millis(50);", kind: Ours },
-        PaneLine { text: "    backoff::run(c, n, base)", kind: Ours },
-        PaneLine { text: "}", kind: Context },
+        PaneLine { text: "line one", kind: Context },
+        PaneLine { text: "FEATURE A change", kind: Ours },
+        PaneLine { text: "line three", kind: Context },
     ];
-    // result pane — the editable center, seeded from theirs, block 0 taken ours.
+    // result pane — editable center, seeded from theirs; the block is still on
+    // theirs (the unresolved initial state).
     let result = vec![
-        PaneLine { text: "pub fn connect(addr: &str) -> Result<Conn> {", kind: Context },
-        PaneLine { text: "    let cfg = Config::from_env()?;", kind: Context },
-        PaneLine { text: "    let timeout = Duration::from_secs(30);", kind: Ours },
-        PaneLine { text: "    let conn = Conn::dial(addr, cfg)?;", kind: Context },
-        PaneLine { text: "    conn.set_timeout(timeout);", kind: Context },
-        PaneLine { text: "    conn.set_keepalive(true);", kind: Theirs },
-        PaneLine { text: "    retry_backoff(conn, 3)", kind: Theirs },
-        PaneLine { text: "}", kind: Context },
-        PaneLine { text: "", kind: Context },
-        PaneLine { text: "fn retry_backoff(c: Conn, n: u32) -> Result<Conn> {", kind: Context },
-        // Block 2 — user took BOTH sides (ours + theirs concatenated).
-        PaneLine { text: "    let base = Duration::from_millis(50);", kind: Both },
-        PaneLine { text: "    let jitter = rng().gen_range(0..25);", kind: Both },
-        // Block 3 — user hand-edited (mixed source).
-        PaneLine { text: "    backoff::run(c, n, base, jitter) // tuned", kind: Mixed },
-        PaneLine { text: "}", kind: Context },
+        PaneLine { text: "line one", kind: Context },
+        PaneLine { text: "FEATURE B change", kind: Theirs },
+        PaneLine { text: "line three", kind: Context },
     ];
-    // theirs pane — read-only side #2.
+    // theirs pane (feature-b) — read-only side #2.
     let theirs = vec![
-        PaneLine { text: "pub fn connect(addr: &str) -> Result<Conn> {", kind: Context },
-        PaneLine { text: "    let cfg = Config::from_env()?;", kind: Context },
-        PaneLine { text: "    let timeout = Duration::from_secs(60);", kind: Theirs },
-        PaneLine { text: "    let conn = Conn::dial(addr, cfg)?;", kind: Context },
-        PaneLine { text: "    conn.set_timeout(timeout);", kind: Context },
-        PaneLine { text: "    conn.set_keepalive(true);", kind: Theirs },
-        PaneLine { text: "    retry_backoff(conn, 3)", kind: Theirs },
-        PaneLine { text: "}", kind: Context },
-        PaneLine { text: "", kind: Context },
-        PaneLine { text: "fn retry_backoff(c: Conn, n: u32) -> Result<Conn> {", kind: Context },
-        PaneLine { text: "    let jitter = rng().gen_range(0..25);", kind: Theirs },
-        PaneLine { text: "    backoff::run(c, n, jitter)", kind: Theirs },
-        PaneLine { text: "}", kind: Context },
+        PaneLine { text: "line one", kind: Context },
+        PaneLine { text: "FEATURE B change", kind: Theirs },
+        PaneLine { text: "line three", kind: Context },
     ];
-    let blocks = vec![
-        // Block 0 resolved to ours (line 2 in result).
-        MockBlock { result_from: 2, result_to: 3, source: Ours },
-        // Block 1 still on theirs (lines 5–6 in result) — pending.
-        MockBlock { result_from: 5, result_to: 7, source: Theirs },
-        // Block 2 — took both (lines 10–11 in result).
-        MockBlock { result_from: 10, result_to: 12, source: Both },
-        // Block 3 — hand-edited / mixed (line 12 in result).
-        MockBlock { result_from: 12, result_to: 13, source: Mixed },
-    ];
-    let groups = vec![
-        MockCommitGroup {
-            change_id: "qpvuntsm",
-            description: "feat: connection retry + keepalive",
-            files: vec![
-                MockFile { path: "src/api.rs", sides: 2, resolved: false },
-                MockFile { path: "src/config.rs", sides: 2, resolved: true },
-            ],
-        },
-        MockCommitGroup {
-            change_id: "zzfkpwmx",
-            description: "refactor: extract transport layer",
-            files: vec![MockFile { path: "src/transport/mod.rs", sides: 3, resolved: false }],
-        },
-    ];
+    // One conflict block on result line 1 (0-based), currently theirs → pending,
+    // and the keyboard-nav current block (amber ring).
+    let blocks = vec![MockBlock { result_from: 1, result_to: 2, source: Theirs, current: true }];
+    // Single commit group — the merge commit owning the one conflicted file.
+    let groups = vec![MockCommitGroup {
+        change_id: "uylryrpk",
+        description: "merge: combine features",
+        files: vec![MockFile { path: "greeting.txt", sides: 2, resolved: false }],
+    }];
     MockConflict {
-        open_path: "src/api.rs",
-        ours_ref: "qpvuntsm",
-        theirs_ref: "mlkpwrqz",
+        open_path: "greeting.txt",
+        ours_ref: "zvntrlvk",
+        ours_label: "feature-a: rewrite line two",
+        theirs_ref: "lopwknrv",
+        theirs_label: "feature-b: rewrite line two",
         ours,
         result,
         theirs,
@@ -423,12 +393,18 @@ fn merge_toolbar(scene: &mut Scene, rect: Rect, c: &MockConflict, ctx: &RenderCt
     );
     x = pill.x1;
 
-    // `.merge-nav`: ‹ current of total › (mono, subtext0).
-    let nav = format!("\u{2039}  1 of {total}  \u{203A}");
+    // `.merge-nav`: ‹ button › button with `{current} of {total}` between them.
+    // The chevrons are `.merge-nav-btn` — 18px squares, surface0 bg / surface1
+    // border (NOT bare glyphs).
+    let current = c.blocks.iter().position(|b| b.current).unwrap_or(0) + 1;
+    x = nav_btn(scene, x + 12.0, cy, "\u{2039}", ctx);
+    let pos = format!("{current} of {total}");
+    let pw = text::measure(&ctx.fonts.mono, font::FS_XS, &pos) as f64;
     text::draw_text(
         scene, &ctx.fonts.mono, font::FS_XS, t.subtext0,
-        x + 12.0, baseline_for(cy, font::FS_XS, &ctx.fonts.mono), &nav,
+        x + 8.0, baseline_for(cy, font::FS_XS, &ctx.fonts.mono), &pos,
     );
+    nav_btn(scene, x + 8.0 + pw + 8.0, cy, "\u{203A}", ctx);
 
     // Right-anchored buttons (drawn right→left): [Cancel] [Save] [◫◫◫]
     // [All theirs ←←] [→→ All ours].
@@ -473,6 +449,22 @@ fn btn(
     r.x0
 }
 
+/// A `.merge-nav-btn`: 18px square, surface0 bg + surface1 border, centered
+/// chevron glyph. Returns the right edge x so the next element can follow.
+fn nav_btn(scene: &mut Scene, left_x: f64, cy: f64, glyph: &str, ctx: &RenderCtx) -> f64 {
+    let t = ctx.theme;
+    let r = Rect::new(left_x, cy - 9.0, left_x + 18.0, cy + 9.0);
+    fill_round(scene, r, 3.0, t.surface0);
+    stroke_round(scene, r, 3.0, t.surface1, 1.0);
+    let sz = font::FS_SM;
+    let gw = text::measure(&ctx.fonts.ui, sz, glyph) as f64;
+    text::draw_text(
+        scene, &ctx.fonts.ui, sz, t.text,
+        r.center().x - gw / 2.0, baseline_for(cy, sz, &ctx.fonts.ui), glyph,
+    );
+    r.x1
+}
+
 // ───────────────────────────── pane headers ───────────────────────────────
 
 /// `.merge-headers`: three flex headers aligned to the pane columns — ⬅ ours
@@ -493,12 +485,13 @@ fn pane_headers(scene: &mut Scene, rect: Rect, c: &MockConflict, ctx: &RenderCtx
     let mut x = o.x0 + PAD_X;
     x = text::draw_text(scene, &ctx.fonts.ui, sz, t.subtext0, x, baseline_for(cy, sz, &ctx.fonts.ui), "\u{2B05} ");
     x = text::draw_text(
-        scene, &ctx.fonts.mono, font::FS_2XS, t.amber,
-        x, baseline_for(cy, font::FS_2XS, &ctx.fonts.mono), c.ours_ref,
+        scene, &ctx.fonts.mono, font::FS_XS, t.amber,
+        x, baseline_for(cy, font::FS_XS, &ctx.fonts.mono), c.ours_ref,
     );
+    let olabel = format!(" \u{00B7}{}", c.ours_label);
     draw_clipped(
         scene, &ctx.fonts.ui, sz, t.subtext0,
-        x + 6.0, baseline_for(cy, sz, &ctx.fonts.ui), " · Ours (side #1)", o.x1 - PAD_X,
+        x + 4.0, baseline_for(cy, sz, &ctx.fonts.ui), &olabel, o.x1 - PAD_X,
     );
 
     // center header — ✎ Result, bold text, side borders.
@@ -510,16 +503,23 @@ fn pane_headers(scene: &mut Scene, rect: Rect, c: &MockConflict, ctx: &RenderCtx
         ctr.x0 + PAD_X, baseline_for(cy, sz, &ctx.fonts.ui_bold), "\u{270E} Result",
     );
 
-    // theirs header — blue 3px right rail + faint blue wash, right-aligned label.
+    // theirs header — blue 3px right rail + faint blue wash, right-aligned:
+    // `{ref} ·{label} ➡` with the change-id in amber mono.
     let th = cols.theirs;
     fill_rect(scene, th, mix_alpha(t.blue, 4.0));
     fill_rect(scene, Rect::new(th.x1 - 3.0, th.y0, th.x1, th.y1), t.blue);
-    let label = format!("{} · Theirs (side #2) \u{27A1}", c.theirs_ref);
-    let lw = text::measure(&ctx.fonts.ui, sz, &label) as f64;
+    let tlabel = format!(" \u{00B7}{} \u{27A1}", c.theirs_label);
+    let refw = text::measure(&ctx.fonts.mono, font::FS_XS, c.theirs_ref) as f64;
+    let lblw = text::measure(&ctx.fonts.ui, sz, &tlabel) as f64;
+    let right = th.x1 - 3.0 - PAD_X;
+    let start = (right - refw - lblw).max(th.x0 + PAD_X);
+    let after = text::draw_text(
+        scene, &ctx.fonts.mono, font::FS_XS, t.amber,
+        start, baseline_for(cy, font::FS_XS, &ctx.fonts.mono), c.theirs_ref,
+    );
     draw_clipped(
         scene, &ctx.fonts.ui, sz, t.subtext0,
-        (th.x1 - 3.0 - PAD_X - lw).max(th.x0 + PAD_X),
-        baseline_for(cy, sz, &ctx.fonts.ui), &label, th.x1 - 3.0 - PAD_X + 2.0,
+        after, baseline_for(cy, sz, &ctx.fonts.ui), &tlabel, right + 2.0,
     );
 }
 
@@ -654,9 +654,11 @@ fn side_colors(t: &Palette, s: Side) -> (Color, Color) {
     }
 }
 
-/// Inter-pane arrow gutter: one arrow chip per conflict block, vertically
-/// aligned to the block's result rows. Ours gutter draws `→` (green), theirs
-/// gutter draws `←` (blue); an "applied" block dims its arrow.
+/// Inter-pane arrow gutter: a faint side-tinted ribbon over each conflict
+/// block's rows + an arrow chip (`.merge-arrow`) at the block's first row. Ours
+/// gutter draws `→` (green); theirs gutter draws `←` (blue) plus a take-both `⇄`
+/// chip below it (`.merge-arrow-both`). An "applied" block dims its arrow; the
+/// keyboard-nav `current` block gets a 2px amber ring (`.merge-arrow-current`).
 fn arrow_gutter(scene: &mut Scene, rect: Rect, c: &MockConflict, gutter_side: Side, ctx: &RenderCtx) {
     let t = ctx.theme;
     // Faint directional wash over the gutter (`.merge-gutter-{ours,theirs}`).
@@ -666,34 +668,80 @@ fn arrow_gutter(scene: &mut Scene, rect: Rect, c: &MockConflict, gutter_side: Si
     };
     fill_rect(scene, rect, wash);
 
+    let ribbon = match gutter_side {
+        Side::Ours => t.green,
+        _ => t.blue,
+    };
+
     // Result-pane rows start at `rect.y0` (panes share the same top).
     for b in &c.blocks {
-        let block_cy = rect.y0 + (b.result_from as f64 + b.result_to as f64) / 2.0 * ROW_H;
-        if block_cy < rect.y0 || block_cy > rect.y1 {
+        let top = rect.y0 + b.result_from as f64 * ROW_H;
+        let bot = rect.y0 + b.result_to as f64 * ROW_H;
+        if top > rect.y1 {
             continue;
         }
         let applied = b.source == gutter_side;
-        let (glyph, base_color) = match gutter_side {
-            Side::Ours => ("\u{2192}", t.green),
-            _ => ("\u{2190}", t.blue),
-        };
-        // Chip: 18px rounded square, centered in the 40px gutter.
-        let chip = Rect::new(rect.x0 + 11.0, block_cy - 9.0, rect.x0 + 11.0 + 18.0, block_cy + 9.0);
-        let (chip_bg, chip_fg) = if applied {
-            // `.merge-arrow-applied`: muted surface0 / subtext0.
-            (t.surface0, t.subtext0)
-        } else {
-            (mix(base_color, t.surface0, 25.0), base_color)
-        };
-        fill_round(scene, chip, 3.0, chip_bg);
-        let asz = font::FS_MD;
-        let aw = text::measure(&ctx.fonts.ui_bold, asz, glyph) as f64;
-        text::draw_text(
-            scene, &ctx.fonts.ui_bold, asz, chip_fg,
-            chip.center().x - aw / 2.0,
-            baseline_for(chip.center().y, asz, &ctx.fonts.ui_bold), glyph,
-        );
+
+        // `.merge-ribbon-*`: faint side-tinted band spanning the block rows
+        // (current block reads brighter — `.merge-ribbon-current`).
+        let ribbon_a = if applied { 4.0 } else if b.current { 22.0 } else { 12.0 };
+        fill_rect(scene, Rect::new(rect.x0, top, rect.x1, bot), mix_alpha(ribbon, ribbon_a));
+
+        // Chip at the block's first row (`.merge-arrow` translateY = slot.y).
+        // Every arrow of the current block carries the amber ring.
+        let chip_cy = top + ROW_H / 2.0;
+        let glyph = if matches!(gutter_side, Side::Ours) { "\u{2192}" } else { "\u{2190}" };
+        arrow_chip(scene, rect, chip_cy, glyph, ribbon, applied, b.current, false, ctx);
+
+        // Take-both `⇄` chip — only in the theirs gutter, 20px below the `←`.
+        // `.merge-arrow-both`: green→blue blend bg with white (text) arrows.
+        if !matches!(gutter_side, Side::Ours) {
+            let both_applied = b.source == Side::Both;
+            let blend = mix(t.green, t.blue, 50.0);
+            arrow_chip(scene, rect, chip_cy + 20.0, "\u{21C4}", blend, both_applied, b.current, true, ctx);
+        }
     }
+}
+
+/// One `.merge-arrow` chip: 18px rounded square centered in the 40px gutter,
+/// tinted bg + matching border, dimmed when `applied`, amber-ringed when
+/// `current`.
+fn arrow_chip(
+    scene: &mut Scene,
+    rect: Rect,
+    cy: f64,
+    glyph: &str,
+    color: Color,
+    applied: bool,
+    current: bool,
+    text_fg: bool,
+    ctx: &RenderCtx,
+) {
+    let t = ctx.theme;
+    let chip = Rect::new(rect.x0 + 11.0, cy - 9.0, rect.x0 + 11.0 + 18.0, cy + 9.0);
+    let (chip_bg, chip_fg, chip_border) = if applied {
+        // `.merge-arrow-applied`: muted surface0 / subtext0.
+        (t.surface0, t.subtext0, t.surface1)
+    } else {
+        // `.merge-arrow-both` uses white (text) arrows; the side arrows use the
+        // side color as the glyph fg.
+        let fg = if text_fg { t.text } else { color };
+        (mix(color, t.surface0, 25.0), fg, mix(color, t.surface1, 55.0))
+    };
+    fill_round(scene, chip, 3.0, chip_bg);
+    stroke_round(scene, chip, 3.0, chip_border, 1.0);
+    if current {
+        // `.merge-arrow-current`: 2px amber outline, 1px offset.
+        let ring = Rect::new(chip.x0 - 2.0, chip.y0 - 2.0, chip.x1 + 2.0, chip.y1 + 2.0);
+        stroke_round(scene, ring, 4.0, t.amber, 2.0);
+    }
+    let asz = font::FS_MD;
+    let aw = text::measure(&ctx.fonts.ui_bold, asz, glyph) as f64;
+    text::draw_text(
+        scene, &ctx.fonts.ui_bold, asz, chip_fg,
+        chip.center().x - aw / 2.0,
+        baseline_for(chip.center().y, asz, &ctx.fonts.ui_bold), glyph,
+    );
 }
 
 /// `.merge-minimap`: proportional chips showing where each block sits, colored
@@ -714,7 +762,12 @@ fn minimap(scene: &mut Scene, rect: Rect, c: &MockConflict, ctx: &RenderCtx) {
             Side::Mixed => t.amber,
             _ => t.green,
         };
-        fill_round(scene, chip, 2.0, mix_alpha(color, 50.0));
+        // `.merge-minimap-chip`: 0.5 opacity, 1.0 + amber outline when current.
+        let alpha = if b.current { 100.0 } else { 50.0 };
+        fill_round(scene, chip, 2.0, mix_alpha(color, alpha));
+        if b.current {
+            stroke_round(scene, chip, 2.0, t.amber, 1.0);
+        }
     }
 }
 
