@@ -51,6 +51,116 @@ impl Loaded {
     pub fn wc_commit_id_hex(&self) -> Option<String> {
         self.wc_commit_id.as_ref().map(|id| id.hex())
     }
+
+    /// The hex id of the operation this repo snapshot is loaded at. This is the
+    /// repo's identity key for caching: if it has not changed, neither the graph
+    /// nor any commit's contents can have changed, so a reload is pure waste.
+    pub fn current_op_id_hex(&self) -> String {
+        self.repo.operation().id().hex()
+    }
+
+    /// The current head operation id(s) on disk, read cheaply from the op-heads
+    /// store **without** resolving/loading the whole repo. Comparing this against
+    /// [`Self::current_op_id_hex`] is the cheap "did anything actually change?"
+    /// gate that lets the reactive reload skip work when a filesystem event fired
+    /// but the op log did not move (e.g. an unrelated `.jj/` touch).
+    ///
+    /// Returns the heads sorted+joined so the value is a stable identity string.
+    /// On a clean repo there is exactly one head; multiple heads only appear
+    /// mid-operation (a concurrent writer), in which case any change is reported.
+    pub fn op_heads_on_disk(&self) -> anyhow::Result<String> {
+        let store = self.workspace.repo_loader().op_heads_store().clone();
+        let mut heads = pollster::block_on(async { store.get_op_heads().await })
+            .map_err(|e| anyhow!("reading op heads: {e}"))?;
+        heads.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        Ok(heads.iter().map(|id| id.hex()).collect::<Vec<_>>().join(","))
+    }
+
+    /// Re-resolve this workspace at the current head operation in place, reusing
+    /// the already-open [`Workspace`] (so we pay only `load_at_head` + the wc-id
+    /// lookup, not a fresh `Workspace::load`). Returns the new head op id (hex).
+    ///
+    /// This is the hot path of the reactive reload: cheap relative to opening,
+    /// because the stores (git backend, op store, index store) stay warm.
+    pub fn reload_at_head(&mut self) -> anyhow::Result<String> {
+        let repo: Arc<ReadonlyRepo> =
+            pollster::block_on(self.workspace.repo_loader().load_at_head())
+                .context("reloading repo at head")?;
+        let wc_name = self.workspace.workspace_name().to_owned();
+        self.wc_commit_id = repo.view().get_wc_commit_id(&wc_name).cloned();
+        self.repo = repo;
+        Ok(self.current_op_id_hex())
+    }
+}
+
+/// A bounded, op-keyed cache of per-commit diffs. The model already keys a
+/// [`CommitDiff`] by its `commit_id`, and a commit's contents are immutable once
+/// written, so a diff computed for commit X is valid for the life of the process
+/// regardless of how the op log moves. This cache exploits exactly that: the
+/// reactive reload reuses a cached diff by `commit_id` instead of re-streaming
+/// the tree diff (the dominant cost on huge diffs).
+///
+/// Bounded LRU-ish: when full, the oldest insertion is evicted. Cheap wins only
+/// — this is not an attempt at perfect cache policy.
+#[derive(Default)]
+pub struct DiffCache {
+    map: HashMap<String, Arc<CommitDiff>>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl DiffCache {
+    /// A cache holding at most `cap` per-commit diffs (0 disables caching).
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+            order: std::collections::VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// Get the diff for `commit_id`, computing+caching it on a miss. On a hit
+    /// this is an `Arc` clone (effectively free) — the cheap win for huge diffs
+    /// when the selected commit is unchanged across reloads.
+    pub fn get_or_compute(
+        &mut self,
+        loaded: &Loaded,
+        commit_id: &str,
+    ) -> anyhow::Result<Arc<CommitDiff>> {
+        if let Some(d) = self.map.get(commit_id) {
+            return Ok(d.clone());
+        }
+        let diff = Arc::new(commit_diff(loaded, commit_id)?);
+        self.insert(commit_id.to_owned(), diff.clone());
+        Ok(diff)
+    }
+
+    /// Whether a diff for `commit_id` is already cached (no computation).
+    pub fn contains(&self, commit_id: &str) -> bool {
+        self.map.contains_key(commit_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn insert(&mut self, key: String, diff: Arc<CommitDiff>) {
+        if self.cap == 0 {
+            return;
+        }
+        if !self.map.contains_key(&key) {
+            self.order.push_back(key.clone());
+            while self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+        self.map.insert(key, diff);
+    }
 }
 
 /// Open the jj workspace whose working-copy root is `path`.
